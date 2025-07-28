@@ -1,16 +1,15 @@
 import os
-import logging
-import hashlib
-import random
-import string
 import json
+import uuid
 import asyncio
+import logging
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters, ContextTypes
 from typing import Dict, List, Optional
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.constants import ParseMode
+import sqlite3
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -21,1127 +20,859 @@ logger = logging.getLogger(__name__)
 
 # Bot configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required")
+BOT_USERNAME = os.getenv('BOT_USERNAME', 'Files_store_NY_bot')
+PORT = int(os.getenv('PORT', 8080))
 
-# In-memory storage (for demo - use database in production)
-class DataStore:
+class FileStorageBot:
     def __init__(self):
-        self.files = {}  # file_id: {owner_id, filename, file_data, price, access_count, created_at}
-        self.redeem_codes = {}  # code: file_id
-        self.user_files = {}  # user_id: [file_ids]
-        self.user_stars = {}  # user_id: star_balance
-        self.access_history = {}  # user_id: [file_ids_accessed]
-
-    def add_file(self, file_id: str, owner_id: int, filename: str, file_data: dict, price: int = 0):
-        self.files[file_id] = {
-            'owner_id': owner_id,
-            'filename': filename,
-            'file_data': file_data,
-            'price': price,
-            'access_count': 0,
-            'created_at': datetime.now().isoformat(),
-            'redeem_codes': []
-        }
+        self.db_path = 'bot_data.db'
+        self.init_database()
         
-        if owner_id not in self.user_files:
-            self.user_files[owner_id] = []
-        self.user_files[owner_id].append(file_id)
+    def init_database(self):
+        """Initialize SQLite database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        return file_id
-
-    def generate_redeem_code(self, file_id: str) -> str:
-        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        self.redeem_codes[code] = file_id
-        if file_id in self.files:
-            self.files[file_id]['redeem_codes'].append(code)
+        # Users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                stars_balance INTEGER DEFAULT 0,
+                total_earned INTEGER DEFAULT 0,
+                join_date TEXT
+            )
+        ''')
+        
+        # Files table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY,
+                owner_id INTEGER,
+                file_name TEXT,
+                file_id TEXT,
+                file_type TEXT,
+                description TEXT,
+                stars_price INTEGER,
+                is_free BOOLEAN DEFAULT 0,
+                upload_date TEXT,
+                downloads INTEGER DEFAULT 0,
+                public_link TEXT
+            )
+        ''')
+        
+        # Redeem codes table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS redeem_codes (
+                code TEXT PRIMARY KEY,
+                file_id TEXT,
+                created_by INTEGER,
+                uses_left INTEGER,
+                max_uses INTEGER,
+                created_date TEXT,
+                FOREIGN KEY (file_id) REFERENCES files (id)
+            )
+        ''')
+        
+        # Transactions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                file_id TEXT,
+                stars_amount INTEGER,
+                transaction_type TEXT,
+                date TEXT
+            )
+        ''')
+        
+        # User file access table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_file_access (
+                user_id INTEGER,
+                file_id TEXT,
+                access_date TEXT,
+                access_method TEXT,
+                PRIMARY KEY (user_id, file_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """Get user from database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                'user_id': result[0],
+                'username': result[1],
+                'stars_balance': result[2],
+                'total_earned': result[3],
+                'join_date': result[4]
+            }
+        return None
+    
+    def create_user(self, user_id: int, username: str = None):
+        """Create new user"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR IGNORE INTO users (user_id, username, join_date)
+            VALUES (?, ?, ?)
+        ''', (user_id, username, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    
+    def update_user_stars(self, user_id: int, stars: int, transaction_type: str = 'earned'):
+        """Update user stars balance"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if transaction_type == 'earned':
+            cursor.execute('''
+                UPDATE users SET stars_balance = stars_balance + ?, total_earned = total_earned + ?
+                WHERE user_id = ?
+            ''', (stars, stars, user_id))
+        else:
+            cursor.execute('''
+                UPDATE users SET stars_balance = stars_balance - ?
+                WHERE user_id = ?
+            ''', (stars, user_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def save_file(self, owner_id: int, file_name: str, file_id: str, file_type: str, 
+                  description: str = "", stars_price: int = 0) -> str:
+        """Save file to database"""
+        file_uuid = str(uuid.uuid4())
+        public_link = f"https://t.me/{BOT_USERNAME}?start=file_{file_uuid}"
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO files (id, owner_id, file_name, file_id, file_type, description, 
+                             stars_price, is_free, upload_date, public_link)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (file_uuid, owner_id, file_name, file_id, file_type, description, 
+              stars_price, stars_price == 0, datetime.now().isoformat(), public_link))
+        conn.commit()
+        conn.close()
+        
+        return file_uuid
+    
+    def get_file(self, file_id: str) -> Optional[Dict]:
+        """Get file from database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM files WHERE id = ?', (file_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                'id': result[0],
+                'owner_id': result[1],
+                'file_name': result[2],
+                'file_id': result[3],
+                'file_type': result[4],
+                'description': result[5],
+                'stars_price': result[6],
+                'is_free': result[7],
+                'upload_date': result[8],
+                'downloads': result[9],
+                'public_link': result[10]
+            }
+        return None
+    
+    def create_redeem_code(self, file_id: str, created_by: int, max_uses: int = 1) -> str:
+        """Create redeem code for file"""
+        code = f"REDEEM_{uuid.uuid4().hex[:8].upper()}"
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO redeem_codes (code, file_id, created_by, uses_left, max_uses, created_date)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (code, file_id, created_by, max_uses, max_uses, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        
         return code
-
-    def get_file_by_code(self, code: str) -> Optional[str]:
-        return self.redeem_codes.get(code)
-
-    def add_stars(self, user_id: int, amount: int):
-        if user_id not in self.user_stars:
-            self.user_stars[user_id] = 0
-        self.user_stars[user_id] += amount
-
-    def deduct_stars(self, user_id: int, amount: int) -> bool:
-        if user_id not in self.user_stars:
-            self.user_stars[user_id] = 0
+    
+    def use_redeem_code(self, code: str, user_id: int) -> tuple[bool, str]:
+        """Use redeem code"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        if self.user_stars[user_id] >= amount:
-            self.user_stars[user_id] -= amount
+        # Check if code exists and has uses left
+        cursor.execute('SELECT * FROM redeem_codes WHERE code = ? AND uses_left > 0', (code,))
+        result = cursor.fetchone()
+        
+        if not result:
+            conn.close()
+            return False, "Invalid or expired redeem code."
+        
+        file_id = result[1]
+        
+        # Check if user already has access
+        cursor.execute('SELECT * FROM user_file_access WHERE user_id = ? AND file_id = ?', (user_id, file_id))
+        if cursor.fetchone():
+            conn.close()
+            return False, "You already have access to this file."
+        
+        # Grant access and decrease uses
+        cursor.execute('''
+            INSERT INTO user_file_access (user_id, file_id, access_date, access_method)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, file_id, datetime.now().isoformat(), 'redeem_code'))
+        
+        cursor.execute('UPDATE redeem_codes SET uses_left = uses_left - 1 WHERE code = ?', (code,))
+        
+        conn.commit()
+        conn.close()
+        
+        return True, "Redeem code used successfully! You now have access to the file."
+    
+    def has_file_access(self, user_id: int, file_id: str) -> bool:
+        """Check if user has access to file"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Check if user owns the file
+        cursor.execute('SELECT owner_id FROM files WHERE id = ?', (file_id,))
+        result = cursor.fetchone()
+        if result and result[0] == user_id:
+            conn.close()
             return True
-        return False
+        
+        # Check if user has purchased access
+        cursor.execute('SELECT * FROM user_file_access WHERE user_id = ? AND file_id = ?', (user_id, file_id))
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result is not None
+    
+    def get_user_files(self, user_id: int) -> List[Dict]:
+        """Get all files owned by user"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM files WHERE owner_id = ? ORDER BY upload_date DESC', (user_id,))
+        results = cursor.fetchall()
+        conn.close()
+        
+        files = []
+        for result in results:
+            files.append({
+                'id': result[0],
+                'owner_id': result[1],
+                'file_name': result[2],
+                'file_id': result[3],
+                'file_type': result[4],
+                'description': result[5],
+                'stars_price': result[6],
+                'is_free': result[7],
+                'upload_date': result[8],
+                'downloads': result[9],
+                'public_link': result[10]
+            })
+        
+        return files
 
-    def get_user_stars(self, user_id: int) -> int:
-        return self.user_stars.get(user_id, 0)
-
-# Initialize data store
-data_store = DataStore()
-
-def generate_file_id():
-    """Generate unique file ID"""
-    return hashlib.md5(f"{datetime.now().isoformat()}{random.randint(1000, 9999)}".encode()).hexdigest()[:12]
+# Initialize bot instance
+bot_instance = FileStorageBot()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     user = update.effective_user
-    welcome_text = f"""
-🎉 Welcome to File Share Bot, {user.first_name}!
-
-📁 **Features:**
-• Upload files and get shareable links
-• Set Stars price for file access
-• Generate redeem codes for free access
-• Manage your uploaded files
-• Buy Stars to access premium files
-
-💫 **Your Stars Balance:** {data_store.get_user_stars(user.id)} ⭐
-
-**Commands:**
-/upload - Upload a new file
-/myfiles - View your uploaded files
-/buystars - Purchase Stars
-/redeem - Use redeem code
-/help - Show help
-
-🚀 Start by uploading a file or browsing available content!
-    """
+    bot_instance.create_user(user.id, user.username)
     
-    keyboard = [
-        [InlineKeyboardButton("📤 Upload File", callback_data="upload")],
-        [InlineKeyboardButton("📂 My Files", callback_data="myfiles"),
-         InlineKeyboardButton("💫 Buy Stars", callback_data="buystars")],
-        [InlineKeyboardButton("🎫 Redeem Code", callback_data="redeem"),
-         InlineKeyboardButton("❓ Help", callback_data="help")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command handler"""
-    help_text = """
-📖 **How to use File Share Bot:**
-
-**📤 Uploading Files:**
-1. Click "Upload File" or use /upload
-2. Send any file (document, photo, video, etc.)
-3. Set a price in Stars (0 for free)
-4. Get a shareable link
-
-**💰 Setting Prices:**
-• 0 Stars = Free access
-• 1-100 Stars = Premium access
-• Users pay Stars to download
-
-**🎫 Redeem Codes:**
-• Generate codes for free access to paid files
-• Share codes with specific users
-• Each code can be used once
-
-**💫 Stars System:**
-• Users buy Stars to access premium files
-• File owners earn Stars from downloads
-• Stars can be purchased via Telegram payments
-
-**🔗 Sharing Files:**
-• Each file gets a unique link
-• Click link → Opens bot → Pay/Redeem → Download
-
-**Commands:**
-/start - Main menu
-/upload - Upload new file
-/myfiles - Manage your files
-/buystars - Purchase Stars
-/redeem - Enter redeem code
-/help - This help message
-
-Need more help? Contact @NY_BOTS
-    """
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(help_text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.callback_query.edit_message_text(help_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Upload command handler"""
-    text = """
-📤 **Upload a File**
-
-Send me any file (document, photo, video, audio, etc.) and I'll create a shareable link for it!
-
-After uploading, you can:
-• Set a price in Stars
-• Generate redeem codes
-• Track downloads
-• Manage access
-
-🚀 **Send your file now!**
-    """
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle file uploads"""
-    user = update.effective_user
-    message = update.message
-    
-    # Get file info based on message type
-    file_obj = None
-    filename = None
-    file_type = None
-    
-    if message.document:
-        file_obj = message.document
-        filename = file_obj.file_name or "document"
-        file_type = "document"
-    elif message.photo:
-        file_obj = message.photo[-1]  # Get highest resolution
-        filename = f"photo_{file_obj.file_id[:8]}.jpg"
-        file_type = "photo"
-    elif message.video:
-        file_obj = message.video
-        filename = file_obj.file_name or f"video_{file_obj.file_id[:8]}.mp4"
-        file_type = "video"
-    elif message.audio:
-        file_obj = message.audio
-        filename = file_obj.file_name or f"audio_{file_obj.file_id[:8]}.mp3"
-        file_type = "audio"
-    elif message.voice:
-        file_obj = message.voice
-        filename = f"voice_{file_obj.file_id[:8]}.ogg"
-        file_type = "voice"
-    elif message.video_note:
-        file_obj = message.video_note
-        filename = f"video_note_{file_obj.file_id[:8]}.mp4"
-        file_type = "video_note"
-    elif message.sticker:
-        file_obj = message.sticker
-        filename = f"sticker_{file_obj.file_id[:8]}.webp"
-        file_type = "sticker"
-    else:
-        await message.reply_text("❌ Please send a valid file (document, photo, video, audio, etc.)")
-        return
-    
-    # Store file data
-    file_data = {
-        'file_id': file_obj.file_id,
-        'file_type': file_type,
-        'file_size': getattr(file_obj, 'file_size', 0),
-        'mime_type': getattr(file_obj, 'mime_type', 'unknown')
-    }
-    
-    # Generate unique file ID
-    unique_file_id = generate_file_id()
-    
-    # Add file to storage
-    data_store.add_file(unique_file_id, user.id, filename, file_data)
-    
-    # Ask for price
-    text = f"""
-✅ **File Uploaded Successfully!**
-
-📁 **File:** `{filename}`
-🆔 **File ID:** `{unique_file_id}`
-📊 **Size:** {file_data['file_size']} bytes
-
-💰 **Set Price (in Stars):**
-Choose how many Stars users need to pay to access this file:
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("🆓 Free (0 Stars)", callback_data=f"setprice_{unique_file_id}_0")],
-        [InlineKeyboardButton("⭐ 1 Star", callback_data=f"setprice_{unique_file_id}_1"),
-         InlineKeyboardButton("⭐ 5 Stars", callback_data=f"setprice_{unique_file_id}_5")],
-        [InlineKeyboardButton("⭐ 10 Stars", callback_data=f"setprice_{unique_file_id}_10"),
-         InlineKeyboardButton("⭐ 25 Stars", callback_data=f"setprice_{unique_file_id}_25")],
-        [InlineKeyboardButton("⭐ 50 Stars", callback_data=f"setprice_{unique_file_id}_50"),
-         InlineKeyboardButton("⭐ 100 Stars", callback_data=f"setprice_{unique_file_id}_100")],
-        [InlineKeyboardButton("✏️ Custom Price", callback_data=f"customprice_{unique_file_id}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def set_file_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set file price handler"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data.split('_')
-    file_id = data[1]
-    price = int(data[2])
-    
-    # Update file price
-    if file_id in data_store.files:
-        data_store.files[file_id]['price'] = price
+    # Check if it's a file link
+    if context.args and context.args[0].startswith('file_'):
+        file_id = context.args[0].replace('file_', '')
+        file_data = bot_instance.get_file(file_id)
         
-        # Generate shareable link
-        bot_username = context.bot.username
-        share_link = f"https://t.me/{bot_username}?start=file_{file_id}"
-        
-        text = f"""
-🎉 **File Setup Complete!**
-
-📁 **File:** `{data_store.files[file_id]['filename']}`
-💰 **Price:** {price} Stars {'(Free)' if price == 0 else ''}
-🔗 **Share Link:** `{share_link}`
-
-**What you can do now:**
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("🎫 Generate Redeem Code", callback_data=f"gencode_{file_id}")],
-            [InlineKeyboardButton("📊 View Stats", callback_data=f"stats_{file_id}"),
-             InlineKeyboardButton("✏️ Edit Price", callback_data=f"editprice_{file_id}")],
-            [InlineKeyboardButton("📋 Copy Link", url=share_link)],
-            [InlineKeyboardButton("📂 My Files", callback_data="myfiles"),
-             InlineKeyboardButton("🏠 Main Menu", callback_data="start")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await query.edit_message_text("❌ File not found!")
-
-async def generate_redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate redeem code for file"""
-    query = update.callback_query
-    await query.answer()
-    
-    file_id = query.data.split('_')[1]
-    
-    if file_id in data_store.files:
-        file_info = data_store.files[file_id]
-        
-        # Check if user owns the file
-        if file_info['owner_id'] != query.from_user.id:
-            await query.edit_message_text("❌ You can only generate redeem codes for your own files!")
+        if not file_data:
+            await update.message.reply_text("❌ File not found.")
             return
         
-        # Generate redeem code
-        redeem_code = data_store.generate_redeem_code(file_id)
-        
-        text = f"""
-🎫 **Redeem Code Generated!**
-
-📁 **File:** `{file_info['filename']}`
-🎫 **Redeem Code:** `{redeem_code}`
-
-**Instructions for users:**
-1. Click: /redeem
-2. Enter code: `{redeem_code}`
-3. Get free access to your file!
-
-⚠️ **Note:** Each code can only be used once.
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("🎫 Generate Another Code", callback_data=f"gencode_{file_id}")],
-            [InlineKeyboardButton("📊 View All Codes", callback_data=f"viewcodes_{file_id}")],
-            [InlineKeyboardButton("🔙 Back to File", callback_data=f"fileinfo_{file_id}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await query.edit_message_text("❌ File not found!")
-
-async def my_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's files"""
-    user_id = update.effective_user.id
-    
-    if user_id not in data_store.user_files or not data_store.user_files[user_id]:
-        text = """
-📂 **My Files**
-
-You haven't uploaded any files yet!
-
-🚀 Start by uploading your first file.
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("📤 Upload File", callback_data="upload")],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="start")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-    else:
-        files = data_store.user_files[user_id]
-        text = f"📂 **My Files** ({len(files)} files)\n\n"
-        
-        keyboard = []
-        for file_id in files[-10:]:  # Show last 10 files
-            if file_id in data_store.files:
-                file_info = data_store.files[file_id]
-                filename = file_info['filename'][:25] + ('...' if len(file_info['filename']) > 25 else '')
-                price_text = f"({file_info['price']}⭐)" if file_info['price'] > 0 else "(Free)"
-                
-                button_text = f"📁 {filename} {price_text}"
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"fileinfo_{file_id}")])
-        
-        keyboard.append([InlineKeyboardButton("📤 Upload New File", callback_data="upload")])
-        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="start")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def file_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show detailed file information"""
-    query = update.callback_query
-    await query.answer()
-    
-    file_id = query.data.split('_')[1]
-    
-    if file_id in data_store.files:
-        file_info = data_store.files[file_id]
-        
-        # Check if user owns the file
-        if file_info['owner_id'] != query.from_user.id:
-            await query.edit_message_text("❌ You can only view details of your own files!")
-            return
-        
-        bot_username = context.bot.username
-        share_link = f"https://t.me/{bot_username}?start=file_{file_id}"
-        
-        created_date = datetime.fromisoformat(file_info['created_at']).strftime("%Y-%m-%d %H:%M")
-        
-        text = f"""
-📁 **File Details**
-
-**📋 Info:**
-• Name: `{file_info['filename']}`
-• Price: {file_info['price']} Stars {'(Free)' if file_info['price'] == 0 else ''}
-• Downloads: {file_info['access_count']}
-• Created: {created_date}
-
-**🎫 Redeem Codes:** {len(file_info.get('redeem_codes', []))}
-
-**🔗 Share Link:**
-`{share_link}`
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("🎫 Generate Redeem Code", callback_data=f"gencode_{file_id}"),
-             InlineKeyboardButton("✏️ Edit Price", callback_data=f"editprice_{file_id}")],
-            [InlineKeyboardButton("📊 View Codes", callback_data=f"viewcodes_{file_id}"),
-             InlineKeyboardButton("🗑️ Delete File", callback_data=f"delete_{file_id}")],
-            [InlineKeyboardButton("📋 Copy Link", url=share_link)],
-            [InlineKeyboardButton("🔙 My Files", callback_data="myfiles")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await query.edit_message_text("❌ File not found!")
-
-async def buy_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buy Stars handler"""
-    text = """
-💫 **Buy Stars**
-
-Stars are used to access premium files. Choose a package:
-
-⭐ **Star Packages:**
-• 10 Stars = $0.99
-• 50 Stars = $4.99  
-• 100 Stars = $9.99
-• 500 Stars = $39.99
-
-💡 **How it works:**
-1. Purchase Stars with Telegram Stars payment
-2. Use Stars to access premium files
-3. File owners earn Stars from downloads
-
-💰 **Your Balance:** {data_store.get_user_stars(update.effective_user.id)} ⭐
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("⭐ 10 Stars - $0.99", callback_data="buypack_10_99")],
-        [InlineKeyboardButton("⭐ 50 Stars - $4.99", callback_data="buypack_50_499")],
-        [InlineKeyboardButton("⭐ 100 Stars - $9.99", callback_data="buypack_100_999")],
-        [InlineKeyboardButton("⭐ 500 Stars - $39.99", callback_data="buypack_500_3999")],
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def handle_star_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Stars purchase"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data.split('_')
-    stars = int(data[1])
-    price_cents = int(data[2])
-    
-    # Create payment invoice
-    title = f"{stars} Telegram Stars"
-    description = f"Purchase {stars} Stars for accessing premium files"
-    payload = f"stars_{stars}_{query.from_user.id}"
-    currency = "XTR"  # Telegram Stars currency
-    prices = [LabeledPrice(label=f"{stars} Stars", amount=stars)]
-    
-    try:
-        await context.bot.send_invoice(
-            chat_id=query.from_user.id,
-            title=title,
-            description=description,
-            payload=payload,
-            provider_token="",  # Empty for Telegram Stars
-            currency=currency,
-            prices=prices,
-            start_parameter="stars_purchase"
-        )
-        
-        await query.edit_message_text(
-            f"💫 **Payment Invoice Sent!**\n\nCheck your DM for the payment invoice to purchase {stars} Stars.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="buystars")]])
-        )
-    except Exception as e:
-        logger.error(f"Error sending invoice: {e}")
-        await query.edit_message_text(
-            "❌ **Payment Error**\n\nUnable to process payment at the moment. Please try again later.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="buystars")]])
-        )
-
-async def pre_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle pre-checkout queries"""
-    query = update.pre_checkout_query
-    
-    # Always approve the payment
-    await query.answer(ok=True)
-
-async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle successful payments"""
-    payment = update.message.successful_payment
-    payload_data = payment.invoice_payload.split('_')
-    
-    if len(payload_data) >= 3 and payload_data[0] == "stars":
-        stars_amount = int(payload_data[1])
-        user_id = int(payload_data[2])
-        
-        # Add stars to user account
-        data_store.add_stars(user_id, stars_amount)
-        
-        await update.message.reply_text(
-            f"🎉 **Payment Successful!**\n\n"
-            f"You received {stars_amount} ⭐ Stars!\n"
-            f"Total Balance: {data_store.get_user_stars(user_id)} ⭐\n\n"
-            f"You can now access premium files!"
-        )
-
-async def redeem_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Redeem code command"""
-    text = """
-🎫 **Redeem Code**
-
-Enter your redeem code to get free access to premium files!
-
-💡 **How to use:**
-1. Get a redeem code from file owner
-2. Enter the code below
-3. Get instant access to the file
-
-✏️ **Enter your redeem code:**
-    """
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-        context.user_data['waiting_for_redeem_code'] = True
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-        context.user_data['waiting_for_redeem_code'] = True
-
-async def handle_redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle redeem code input"""
-    if not context.user_data.get('waiting_for_redeem_code'):
-        return
-    
-    code = update.message.text.strip().upper()
-    user_id = update.effective_user.id
-    
-    # Clear waiting state
-    context.user_data['waiting_for_redeem_code'] = False
-    
-    # Check if code exists
-    file_id = data_store.get_file_by_code(code)
-    
-    if not file_id:
-        await update.message.reply_text(
-            "❌ **Invalid Redeem Code**\n\n"
-            "The code you entered is not valid or has already been used.\n"
-            "Please check the code and try again."
-        )
-        return
-    
-    if file_id not in data_store.files:
-        await update.message.reply_text("❌ File not found!")
-        return
-    
-    file_info = data_store.files[file_id]
-    
-    # Remove used code
-    if code in data_store.redeem_codes:
-        del data_store.redeem_codes[code]
-    
-    if 'redeem_codes' in file_info and code in file_info['redeem_codes']:
-        file_info['redeem_codes'].remove(code)
-    
-    # Send file to user
-    await send_file_to_user(update, context, file_id, free_access=True)
-
-async def handle_file_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle file access from start parameter"""
-    if not context.args or len(context.args) == 0:
-        await start(update, context)
-        return
-    
-    param = context.args[0]
-    
-    if param.startswith('file_'):
-        file_id = param[5:]  # Remove 'file_' prefix
-        
-        if file_id in data_store.files:
-            file_info = data_store.files[file_id]
-            user_id = update.effective_user.id
+        # Check if user has access
+        if bot_instance.has_file_access(user.id, file_id):
+            keyboard = [[InlineKeyboardButton("📥 Download File", callback_data=f"download_{file_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             
-            # Check if file is free
-            if file_info['price'] == 0:
-                await send_file_to_user(update, context, file_id, free_access=True)
-                return
-            
-            # Check if user has enough stars
-            user_stars = data_store.get_user_stars(user_id)
-            
-            text = f"""
-📁 **File Access Required**
-
-**File:** `{file_info['filename']}`
-**Price:** {file_info['price']} ⭐ Stars
-**Your Balance:** {user_stars} ⭐ Stars
-
-{'✅ You have enough Stars!' if user_stars >= file_info['price'] else '❌ Insufficient Stars!'}
-            """
-            
-            keyboard = []
-            
-            if user_stars >= file_info['price']:
-                keyboard.append([InlineKeyboardButton(f"💫 Pay {file_info['price']} Stars & Download", 
-                                                     callback_data=f"payfile_{file_id}")])
+            await update.message.reply_text(
+                f"📁 **{file_data['file_name']}**\n\n"
+                f"📝 {file_data['description']}\n"
+                f"⭐ Price: {file_data['stars_price']} stars\n"
+                f"📊 Downloads: {file_data['downloads']}\n\n"
+                f"✅ You have access to this file!",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            if file_data['is_free']:
+                keyboard = [[InlineKeyboardButton("📥 Get Free File", callback_data=f"get_free_{file_id}")]]
             else:
-                needed_stars = file_info['price'] - user_stars
-                keyboard.append([InlineKeyboardButton(f"💫 Buy {needed_stars} More Stars", 
-                                                     callback_data="buystars")])
-            
-            keyboard.extend([
-                [InlineKeyboardButton("🎫 Use Redeem Code", callback_data="redeem")],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="start")]
-            ])
+                keyboard = [
+                    [InlineKeyboardButton(f"⭐ Buy for {file_data['stars_price']} stars", callback_data=f"buy_{file_id}")],
+                    [InlineKeyboardButton("🎟️ Use Redeem Code", callback_data=f"redeem_prompt_{file_id}")]
+                ]
             
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-        else:
-            await update.message.reply_text("❌ File not found or no longer available!")
-
-async def pay_for_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle file payment"""
-    query = update.callback_query
-    await query.answer()
-    
-    file_id = query.data.split('_')[1]
-    user_id = query.from_user.id
-    
-    if file_id not in data_store.files:
-        await query.edit_message_text("❌ File not found!")
-        return
-    
-    file_info = data_store.files[file_id]
-    price = file_info['price']
-    
-    # Check and deduct stars
-    if data_store.deduct_stars(user_id, price):
-        # Add stars to file owner
-        data_store.add_stars(file_info['owner_id'], price)
-        
-        # Send file
-        await send_file_to_user(update, context, file_id, paid_access=True)
-    else:
-        await query.edit_message_text(
-            f"❌ **Insufficient Stars!**\n\n"
-            f"You need {price} ⭐ Stars but only have {data_store.get_user_stars(user_id)} ⭐\n\n"
-            f"Please buy more Stars to access this file.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💫 Buy Stars", callback_data="buystars")]])
-        )
-
-async def send_file_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, free_access: bool = False, paid_access: bool = False):
-    """Send file to user"""
-    if file_id not in data_store.files:
-        if update.message:
-            await update.message.reply_text("❌ File not found!")
-        else:
-            await update.callback_query.edit_message_text("❌ File not found!")
-        return
-    
-    file_info = data_store.files[file_id]
-    file_data = file_info['file_data']
-    user_id = update.effective_user.id
-    
-    # Increment access count
-    data_store.files[file_id]['access_count'] += 1
-    
-    # Add to user's access history
-    if user_id not in data_store.access_history:
-        data_store.access_history[user_id] = []
-    data_store.access_history[user_id].append(file_id)
-    
-    # Prepare success message
-    access_type = "FREE ACCESS" if free_access else ("PAID ACCESS" if paid_access else "ACCESS")
-    success_text = f"""
-✅ **{access_type} GRANTED**
-
-📁 **File:** `{file_info['filename']}`
-💫 **Cost:** {file_info['price']} Stars {'(Free)' if free_access else ''}
-🔄 **Downloads:** {file_info['access_count']}
-
-📥 **Your file is being sent...**
-    """
-    
-    try:
-        # Send the file based on type
-        file_type = file_data['file_type']
-        telegram_file_id = file_data['file_id']
-        
-        if update.message:
-            chat_id = update.message.chat_id
-        else:
-            chat_id = update.callback_query.message.chat_id
-            await update.callback_query.edit_message_text(success_text, parse_mode='Markdown')
-        
-        # Send file based on type
-        if file_type == 'document':
-            await context.bot.send_document(chat_id=chat_id, document=telegram_file_id, 
-                                          caption=f"📁 {file_info['filename']}")
-        elif file_type == 'photo':
-            await context.bot.send_photo(chat_id=chat_id, photo=telegram_file_id,
-                                       caption=f"📸 {file_info['filename']}")
-        elif file_type == 'video':
-            await context.bot.send_video(chat_id=chat_id, video=telegram_file_id,
-                                       caption=f"🎥 {file_info['filename']}")
-        elif file_type == 'audio':
-            await context.bot.send_audio(chat_id=chat_id, audio=telegram_file_id,
-                                       caption=f"🎵 {file_info['filename']}")
-        elif file_type == 'voice':
-            await context.bot.send_voice(chat_id=chat_id, voice=telegram_file_id)
-        elif file_type == 'video_note':
-            await context.bot.send_video_note(chat_id=chat_id, video_note=telegram_file_id)
-        elif file_type == 'sticker':
-            await context.bot.send_sticker(chat_id=chat_id, sticker=telegram_file_id)
-        
-        if update.message:
-            await update.message.reply_text(success_text, parse_mode='Markdown')
             
-    except Exception as e:
-        logger.error(f"Error sending file: {e}")
-        error_text = "❌ **Error sending file**\n\nThe file may no longer be available. Please contact the file owner."
-        
-        if update.message:
-            await update.message.reply_text(error_text)
-        else:
-            await update.callback_query.edit_message_text(error_text)
-
-async def view_redeem_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View all redeem codes for a file"""
-    query = update.callback_query
-    await query.answer()
-    
-    file_id = query.data.split('_')[1]
-    
-    if file_id not in data_store.files:
-        await query.edit_message_text("❌ File not found!")
+            await update.message.reply_text(
+                f"📁 **{file_data['file_name']}**\n\n"
+                f"📝 {file_data['description']}\n"
+                f"⭐ Price: {file_data['stars_price']} stars\n"
+                f"📊 Downloads: {file_data['downloads']}",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
-    
-    file_info = data_store.files[file_id]
-    
-    if file_info['owner_id'] != query.from_user.id:
-        await query.edit_message_text("❌ You can only view codes for your own files!")
-        return
-    
-    codes = file_info.get('redeem_codes', [])
-    
-    if not codes:
-        text = f"""
-🎫 **Redeem Codes**
-
-📁 **File:** `{file_info['filename']}`
-
-No redeem codes generated yet.
-        """
-        keyboard = [
-            [InlineKeyboardButton("🎫 Generate First Code", callback_data=f"gencode_{file_id}")],
-            [InlineKeyboardButton("🔙 Back to File", callback_data=f"fileinfo_{file_id}")]
-        ]
-    else:
-        text = f"""
-🎫 **Redeem Codes** ({len(codes)} active)
-
-📁 **File:** `{file_info['filename']}`
-
-**Active Codes:**
-        """
-        
-        for i, code in enumerate(codes[-10:], 1):  # Show last 10 codes
-            text += f"\n`{code}`"
-        
-        if len(codes) > 10:
-            text += f"\n\n... and {len(codes) - 10} more codes"
-        
-        keyboard = [
-            [InlineKeyboardButton("🎫 Generate New Code", callback_data=f"gencode_{file_id}")],
-            [InlineKeyboardButton("🔙 Back to File", callback_data=f"fileinfo_{file_id}")]
-        ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete a file"""
-    query = update.callback_query
-    await query.answer()
-    
-    file_id = query.data.split('_')[1]
-    
-    if file_id not in data_store.files:
-        await query.edit_message_text("❌ File not found!")
-        return
-    
-    file_info = data_store.files[file_id]
-    
-    if file_info['owner_id'] != query.from_user.id:
-        await query.edit_message_text("❌ You can only delete your own files!")
-        return
-    
-    text = f"""
-🗑️ **Delete File**
-
-📁 **File:** `{file_info['filename']}`
-💰 **Price:** {file_info['price']} Stars
-📊 **Downloads:** {file_info['access_count']}
-
-⚠️ **Warning:** This action cannot be undone!
-All redeem codes for this file will also be deleted.
-
-Are you sure you want to delete this file?
-    """
     
     keyboard = [
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"fileinfo_{file_id}"),
-         InlineKeyboardButton("🗑️ Delete", callback_data=f"confirmdelete_{file_id}")]
+        [InlineKeyboardButton("📤 Upload File", callback_data="upload_file")],
+        [InlineKeyboardButton("📁 My Files", callback_data="my_files")],
+        [InlineKeyboardButton("⭐ My Stars", callback_data="my_stars")],
+        [InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem_code")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def confirm_delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm file deletion"""
-    query = update.callback_query
-    await query.answer()
-    
-    file_id = query.data.split('_')[1]
-    user_id = query.from_user.id
-    
-    if file_id not in data_store.files:
-        await query.edit_message_text("❌ File not found!")
-        return
-    
-    file_info = data_store.files[file_id]
-    
-    if file_info['owner_id'] != user_id:
-        await query.edit_message_text("❌ You can only delete your own files!")
-        return
-    
-    filename = file_info['filename']
-    
-    # Remove redeem codes
-    codes_to_remove = file_info.get('redeem_codes', [])
-    for code in codes_to_remove:
-        if code in data_store.redeem_codes:
-            del data_store.redeem_codes[code]
-    
-    # Remove file from storage
-    del data_store.files[file_id]
-    
-    # Remove from user's file list
-    if user_id in data_store.user_files and file_id in data_store.user_files[user_id]:
-        data_store.user_files[user_id].remove(file_id)
-    
-    text = f"""
-✅ **File Deleted Successfully**
-
-📁 **File:** `{filename}`
-
-The file and all its redeem codes have been permanently deleted.
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("📂 My Files", callback_data="myfiles"),
-         InlineKeyboardButton("🏠 Main Menu", callback_data="start")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def edit_file_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Edit file price"""
-    query = update.callback_query
-    await query.answer()
-    
-    file_id = query.data.split('_')[1]
-    
-    if file_id not in data_store.files:
-        await query.edit_message_text("❌ File not found!")
-        return
-    
-    file_info = data_store.files[file_id]
-    
-    if file_info['owner_id'] != query.from_user.id:
-        await query.edit_message_text("❌ You can only edit your own files!")
-        return
-    
-    text = f"""
-✏️ **Edit File Price**
-
-📁 **File:** `{file_info['filename']}`
-💰 **Current Price:** {file_info['price']} Stars
-
-Select new price:
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("🆓 Free (0 Stars)", callback_data=f"setprice_{file_id}_0")],
-        [InlineKeyboardButton("⭐ 1 Star", callback_data=f"setprice_{file_id}_1"),
-         InlineKeyboardButton("⭐ 5 Stars", callback_data=f"setprice_{file_id}_5")],
-        [InlineKeyboardButton("⭐ 10 Stars", callback_data=f"setprice_{file_id}_10"),
-         InlineKeyboardButton("⭐ 25 Stars", callback_data=f"setprice_{file_id}_25")],
-        [InlineKeyboardButton("⭐ 50 Stars", callback_data=f"setprice_{file_id}_50"),
-         InlineKeyboardButton("⭐ 100 Stars", callback_data=f"setprice_{file_id}_100")],
-        [InlineKeyboardButton("🔙 Cancel", callback_data=f"fileinfo_{file_id}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all callback queries"""
-    query = update.callback_query
-    
-    if query.data == "start":
-        await start(update, context)
-    elif query.data == "upload":
-        await upload_command(update, context)
-    elif query.data == "myfiles":
-        await my_files(update, context)
-    elif query.data == "buystars":
-        await buy_stars(update, context)
-    elif query.data == "redeem":
-        await redeem_code_command(update, context)
-    elif query.data == "help":
-        await help_command(update, context)
-    elif query.data.startswith("setprice_"):
-        await set_file_price(update, context)
-    elif query.data.startswith("gencode_"):
-        await generate_redeem_code(update, context)
-    elif query.data.startswith("fileinfo_"):
-        await file_info(update, context)
-    elif query.data.startswith("viewcodes_"):
-        await view_redeem_codes(update, context)
-    elif query.data.startswith("delete_"):
-        await delete_file(update, context)
-    elif query.data.startswith("confirmdelete_"):
-        await confirm_delete_file(update, context)
-    elif query.data.startswith("editprice_"):
-        await edit_file_price(update, context)
-    elif query.data.startswith("buypack_"):
-        await handle_star_purchase(update, context)
-    elif query.data.startswith("payfile_"):
-        await pay_for_file(update, context)
-
-async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
-    if context.user_data.get('waiting_for_redeem_code'):
-        await handle_redeem_code(update, context)
-        return
-    
-    # If no specific handler, show help
     await update.message.reply_text(
-        "ℹ️ Use /start to see the main menu or /help for assistance.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="start")]])
+        f"🤖 **Welcome to File Storage Bot!**\n\n"
+        f"📤 Upload files and share them with others\n"
+        f"⭐ Earn Telegram Stars from downloads\n"
+        f"🎟️ Create redeem codes for free access\n"
+        f"🔗 Generate public links for sharing\n\n"
+        f"Choose an option below to get started:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
     )
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler for health checks"""
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        
-        response = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Telegram File Bot</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
-                .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                .header { text-align: center; color: #1d72b8; margin-bottom: 30px; }
-                .status { background: #d4edda; color: #155724; padding: 15px; border-radius: 5px; margin: 20px 0; }
-                .info { background: #e2e3e5; padding: 15px; border-radius: 5px; margin: 10px 0; }
-                .feature { margin: 10px 0; padding: 10px; background: #f8f9fa; border-left: 4px solid #007bff; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h1>🤖 Telegram File Bot</h1>
-                    <p>File Sharing with Telegram Stars Payment</p>
-                </div>
-                
-                <div class="status">
-                    <strong>✅ Bot Status:</strong> Online and Running
-                </div>
-                
-                <div class="info">
-                    <strong>🚀 Features:</strong>
-                </div>
-                
-                <div class="feature">📤 Upload any file type and get shareable links</div>
-                <div class="feature">💫 Telegram Stars payment integration</div>
-                <div class="feature">🎫 Generate redeem codes for free access</div>
-                <div class="feature">📊 File management and analytics</div>
-                <div class="feature">👥 Public bot for all users</div>
-                
-                <div class="info">
-                    <strong>📞 Contact:</strong> @NY_BOTS<br>
-                    <strong>🕒 Server Time:</strong> {time}<br>
-                    <strong>🌐 Host:</strong> 0.0.0.0:8080
-                </div>
-                
-                <div style="text-align: center; margin-top: 30px; color: #6c757d;">
-                    <p>Bot is healthy and ready to serve! 🎉</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """.format(time=datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"))
-        
-        self.wfile.write(response.encode())
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document uploads"""
+    user = update.effective_user
+    document = update.message.document
     
-    def log_message(self, format, *args):
-        # Suppress HTTP server logs
-        pass
+    bot_instance.create_user(user.id, user.username)
+    
+    # Store upload context
+    context.user_data['pending_file'] = {
+        'file_name': document.file_name,
+        'file_id': document.file_id,
+        'file_type': 'document'
+    }
+    
+    keyboard = [
+        [InlineKeyboardButton("💰 Set Price (Stars)", callback_data="set_price")],
+        [InlineKeyboardButton("🆓 Make Free", callback_data="make_free")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"📁 **File Received: {document.file_name}**\n\n"
+        f"Choose pricing for your file:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-def start_http_server(port):
-    """Start HTTP server for health checks"""
-    try:
-        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-        logger.info(f"HTTP server started on 0.0.0.0:{port}")
-        server.serve_forever()
-    except Exception as e:
-        logger.error(f"Failed to start HTTP server: {e}")
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo uploads"""
+    user = update.effective_user
+    photo = update.message.photo[-1]  # Get highest quality
+    
+    bot_instance.create_user(user.id, user.username)
+    
+    context.user_data['pending_file'] = {
+        'file_name': f"Photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
+        'file_id': photo.file_id,
+        'file_type': 'photo'
+    }
+    
+    keyboard = [
+        [InlineKeyboardButton("💰 Set Price (Stars)", callback_data="set_price")],
+        [InlineKeyboardButton("🆓 Make Free", callback_data="make_free")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"🖼️ **Photo Received**\n\n"
+        f"Choose pricing for your photo:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle video uploads"""
+    user = update.effective_user
+    video = update.message.video
+    
+    bot_instance.create_user(user.id, user.username)
+    
+    context.user_data['pending_file'] = {
+        'file_name': video.file_name or f"Video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
+        'file_id': video.file_id,
+        'file_type': 'video'
+    }
+    
+    keyboard = [
+        [InlineKeyboardButton("💰 Set Price (Stars)", callback_data="set_price")],
+        [InlineKeyboardButton("🆓 Make Free", callback_data="make_free")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"🎥 **Video Received: {video.file_name or 'Video'}**\n\n"
+        f"Choose pricing for your video:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+    
+    await query.answer()
+    
+    if data == "upload_file":
+        await query.edit_message_text(
+            "📤 **Upload a File**\n\n"
+            "Send me any file (document, photo, video) and I'll help you set it up for sharing!",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "my_files":
+        files = bot_instance.get_user_files(user.id)
+        if not files:
+            await query.edit_message_text("📁 You haven't uploaded any files yet.")
+            return
+        
+        text = "📁 **Your Files:**\n\n"
+        keyboard = []
+        
+        for i, file in enumerate(files[:10]):  # Show first 10 files
+            text += f"{i+1}. {file['file_name']} ({'Free' if file['is_free'] else f\"{file['stars_price']} ⭐\"})\n"
+            keyboard.append([InlineKeyboardButton(f"📋 Manage {file['file_name'][:15]}...", 
+                                                callback_data=f"manage_{file['id']}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    
+    elif data == "my_stars":
+        user_data = bot_instance.get_user(user.id)
+        if not user_data:
+            bot_instance.create_user(user.id, user.username)
+            user_data = bot_instance.get_user(user.id)
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"⭐ **Your Stars Balance**\n\n"
+            f"💰 Current Balance: {user_data['stars_balance']} stars\n"
+            f"📊 Total Earned: {user_data['total_earned']} stars\n"
+            f"📅 Member Since: {user_data['join_date'][:10]}",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "redeem_code":
+        await query.edit_message_text(
+            "🎟️ **Enter Redeem Code**\n\n"
+            "Send me your redeem code to access a file for free!"
+        )
+    
+    elif data == "set_price":
+        await query.edit_message_text(
+            "💰 **Set File Price**\n\n"
+            "Send me the number of stars you want to charge for this file (e.g., 5)"
+        )
+        context.user_data['awaiting_price'] = True
+    
+    elif data == "make_free":
+        pending_file = context.user_data.get('pending_file')
+        if not pending_file:
+            await query.edit_message_text("❌ No pending file found.")
+            return
+        
+        file_id = bot_instance.save_file(
+            user.id,
+            pending_file['file_name'],
+            pending_file['file_id'],
+            pending_file['file_type'],
+            "",
+            0
+        )
+        
+        file_data = bot_instance.get_file(file_id)
+        keyboard = [
+            [InlineKeyboardButton("🔗 Get Public Link", callback_data=f"get_link_{file_id}")],
+            [InlineKeyboardButton("🎟️ Generate Redeem Code", callback_data=f"gen_redeem_{file_id}")],
+            [InlineKeyboardButton("🔙 Back to Main", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"✅ **File Uploaded Successfully!**\n\n"
+            f"📁 Name: {file_data['file_name']}\n"
+            f"⭐ Price: Free\n"
+            f"🔗 Public Link: {file_data['public_link']}",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        del context.user_data['pending_file']
+    
+    elif data.startswith("manage_"):
+        file_id = data.replace("manage_", "")
+        file_data = bot_instance.get_file(file_id)
+        
+        if not file_data or file_data['owner_id'] != user.id:
+            await query.edit_message_text("❌ File not found or access denied.")
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("🔗 Get Public Link", callback_data=f"get_link_{file_id}")],
+            [InlineKeyboardButton("🎟️ Generate Redeem Code", callback_data=f"gen_redeem_{file_id}")],
+            [InlineKeyboardButton("📊 View Stats", callback_data=f"stats_{file_id}")],
+            [InlineKeyboardButton("🔙 Back to Files", callback_data="my_files")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"📋 **Managing File**\n\n"
+            f"📁 Name: {file_data['file_name']}\n"
+            f"⭐ Price: {'Free' if file_data['is_free'] else f\"{file_data['stars_price']} stars\"}\n"
+            f"📊 Downloads: {file_data['downloads']}\n"
+            f"📅 Uploaded: {file_data['upload_date'][:10]}",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data.startswith("get_link_"):
+        file_id = data.replace("get_link_", "")
+        file_data = bot_instance.get_file(file_id)
+        
+        if not file_data:
+            await query.edit_message_text("❌ File not found.")
+            return
+        
+        await query.edit_message_text(
+            f"🔗 **Public Link Generated**\n\n"
+            f"📁 File: {file_data['file_name']}\n"
+            f"🔗 Link: {file_data['public_link']}\n\n"
+            f"Share this link with anyone to let them access your file!",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data.startswith("gen_redeem_"):
+        file_id = data.replace("gen_redeem_", "")
+        file_data = bot_instance.get_file(file_id)
+        
+        if not file_data or file_data['owner_id'] != user.id:
+            await query.edit_message_text("❌ File not found or access denied.")
+            return
+        
+        redeem_code = bot_instance.create_redeem_code(file_id, user.id, 10)  # 10 uses
+        
+        await query.edit_message_text(
+            f"🎟️ **Redeem Code Generated**\n\n"
+            f"📁 File: {file_data['file_name']}\n"
+            f"🎟️ Code: `{redeem_code}`\n"
+            f"🔢 Max Uses: 10\n\n"
+            f"Share this code with users for free access!",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data.startswith("buy_"):
+        file_id = data.replace("buy_", "")
+        file_data = bot_instance.get_file(file_id)
+        user_data = bot_instance.get_user(user.id)
+        
+        if not file_data:
+            await query.edit_message_text("❌ File not found.")
+            return
+        
+        if user_data['stars_balance'] < file_data['stars_price']:
+            await query.edit_message_text(
+                f"❌ **Insufficient Stars**\n\n"
+                f"You need {file_data['stars_price']} stars but only have {user_data['stars_balance']}.\n"
+                f"Please buy more stars to continue."
+            )
+            return
+        
+        # Create Telegram Stars payment
+        keyboard = [[InlineKeyboardButton(f"⭐ Pay {file_data['stars_price']} Stars", 
+                                        callback_data=f"pay_stars_{file_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"💰 **Purchase File**\n\n"
+            f"📁 File: {file_data['file_name']}\n"
+            f"⭐ Price: {file_data['stars_price']} stars\n"
+            f"💳 Your Balance: {user_data['stars_balance']} stars\n\n"
+            f"Click below to complete purchase:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data.startswith("pay_stars_"):
+        file_id = data.replace("pay_stars_", "")
+        file_data = bot_instance.get_file(file_id)
+        user_data = bot_instance.get_user(user.id)
+        
+        if not file_data:
+            await query.edit_message_text("❌ File not found.")
+            return
+        
+        if user_data['stars_balance'] < file_data['stars_price']:
+            await query.edit_message_text("❌ Insufficient stars balance.")
+            return
+        
+        # Process payment
+        bot_instance.update_user_stars(user.id, file_data['stars_price'], 'spent')
+        bot_instance.update_user_stars(file_data['owner_id'], file_data['stars_price'], 'earned')
+        
+        # Grant access
+        conn = sqlite3.connect(bot_instance.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_file_access (user_id, file_id, access_date, access_method)
+            VALUES (?, ?, ?, ?)
+        ''', (user.id, file_id, datetime.now().isoformat(), 'purchase'))
+        
+        cursor.execute('UPDATE files SET downloads = downloads + 1 WHERE id = ?', (file_id,))
+        conn.commit()
+        conn.close()
+        
+        keyboard = [[InlineKeyboardButton("📥 Download File", callback_data=f"download_{file_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"✅ **Purchase Successful!**\n\n"
+            f"📁 File: {file_data['file_name']}\n"
+            f"⭐ Paid: {file_data['stars_price']} stars\n\n"
+            f"You now have access to this file!",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data.startswith("get_free_"):
+        file_id = data.replace("get_free_", "")
+        
+        # Grant access
+        conn = sqlite3.connect(bot_instance.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_file_access (user_id, file_id, access_date, access_method)
+            VALUES (?, ?, ?, ?)
+        ''', (user.id, file_id, datetime.now().isoformat(), 'free'))
+        
+        cursor.execute('UPDATE files SET downloads = downloads + 1 WHERE id = ?', (file_id,))
+        conn.commit()
+        conn.close()
+        
+        keyboard = [[InlineKeyboardButton("📥 Download File", callback_data=f"download_{file_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"✅ **Free File Access Granted!**\n\n"
+            f"You now have access to this file!",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data.startswith("download_"):
+        file_id = data.replace("download_", "")
+        file_data = bot_instance.get_file(file_id)
+        
+        if not file_data:
+            await query.edit_message_text("❌ File not found.")
+            return
+        
+        if not bot_instance.has_file_access(user.id, file_id):
+            await query.edit_message_text("❌ Access denied. Please purchase the file first.")
+            return
+        
+        try:
+            if file_data['file_type'] == 'document':
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=file_data['file_id'],
+                    caption=f"📁 {file_data['file_name']}\n\n{file_data['description']}"
+                )
+            elif file_data['file_type'] == 'photo':
+                await context.bot.send_photo(
+                    chat_id=user.id,
+                    photo=file_data['file_id'],
+                    caption=f"🖼️ {file_data['file_name']}\n\n{file_data['description']}"
+                )
+            elif file_data['file_type'] == 'video':
+                await context.bot.send_video(
+                    chat_id=user.id,
+                    video=file_data['file_id'],
+                    caption=f"🎥 {file_data['file_name']}\n\n{file_data['description']}"
+                )
+            
+            await query.edit_message_text(
+                f"✅ **File Sent Successfully!**\n\n"
+                f"📁 {file_data['file_name']} has been sent to your chat.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.error(f"Error sending file: {e}")
+            await query.edit_message_text("❌ Error sending file. Please try again later.")
+    
+    elif data == "back_to_main":
+        keyboard = [
+            [InlineKeyboardButton("📤 Upload File", callback_data="upload_file")],
+            [InlineKeyboardButton("📁 My Files", callback_data="my_files")],
+            [InlineKeyboardButton("⭐ My Stars", callback_data="my_stars")],
+            [InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem_code")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"🤖 **Welcome to File Storage Bot!**\n\n"
+            f"📤 Upload files and share them with others\n"
+            f"⭐ Earn Telegram Stars from downloads\n"
+            f"🎟️ Create redeem codes for free access\n"
+            f"🔗 Generate public links for sharing\n\n"
+            f"Choose an option below to get started:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
+    user = update.effective_user
+    text = update.message.text
+    
+    # Handle price setting
+    if context.user_data.get('awaiting_price'):
+        try:
+            price = int(text)
+            if price < 0:
+                await update.message.reply_text("❌ Price cannot be negative. Please enter a valid number.")
+                return
+            
+            pending_file = context.user_data.get('pending_file')
+            if not pending_file:
+                await update.message.reply_text("❌ No pending file found.")
+                return
+            
+            file_id = bot_instance.save_file(
+                user.id,
+                pending_file['file_name'],
+                pending_file['file_id'],
+                pending_file['file_type'],
+                "",
+                price
+            )
+            
+            file_data = bot_instance.get_file(file_id)
+            keyboard = [
+                [InlineKeyboardButton("🔗 Get Public Link", callback_data=f"get_link_{file_id}")],
+                [InlineKeyboardButton("🎟️ Generate Redeem Code", callback_data=f"gen_redeem_{file_id}")],
+                [InlineKeyboardButton("🔙 Back to Main", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"✅ **File Uploaded Successfully!**\n\n"
+                f"📁 Name: {file_data['file_name']}\n"
+                f"⭐ Price: {price} stars\n"
+                f"🔗 Public Link: {file_data['public_link']}",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            del context.user_data['pending_file']
+            del context.user_data['awaiting_price']
+            
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number for the price.")
+        return
+    
+    # Handle redeem code
+    if text.startswith('REDEEM_'):
+        success, message = bot_instance.use_redeem_code(text, user.id)
+        
+        if success:
+            # Find the file and show download option
+            conn = sqlite3.connect(bot_instance.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT file_id FROM redeem_codes WHERE code = ?', (text,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                file_id = result[0]
+                keyboard = [[InlineKeyboardButton("📥 Download File", callback_data=f"download_{file_id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await update.message.reply_text(
+                    f"✅ {message}",
+                    reply_markup=reply_markup
+                )
+            else:
+                await update.message.reply_text(f"✅ {message}")
+        else:
+            await update.message.reply_text(f"❌ {message}")
+        return
+    
+    # Default response for unrecognized text
+    await update.message.reply_text(
+        "🤖 I didn't understand that. Use /start to see available options or send me a file to upload!"
+    )
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Exception while handling an update: {context.error}")
 
 def main():
-    """Start the bot"""
+    """Main function to run the bot"""
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN environment variable is required!")
+        return
+    
     try:
-        # Create application with minimal configuration
+        # Create application
         application = Application.builder().token(BOT_TOKEN).build()
         
         # Add handlers
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("upload", upload_command))
-        application.add_handler(CommandHandler("myfiles", my_files))
-        application.add_handler(CommandHandler("buystars", buy_stars))
-        application.add_handler(CommandHandler("redeem", redeem_code_command))
-        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        application.add_handler(CallbackQueryHandler(button_callback))
         
-        # File upload handlers
-        application.add_handler(MessageHandler(
-            filters.Document.ALL | filters.PHOTO | filters.VIDEO | 
-            filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL,
-            handle_file_upload
-        ))
+        # Add error handler
+        application.add_error_handler(error_handler)
         
-        # Text message handler
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
-        
-        # Callback query handler
-        application.add_handler(CallbackQueryHandler(callback_query_handler))
-        
-        # Payment handlers
-        application.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
-        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-        
-        # Get port from environment variable or default to 8080
-        PORT = int(os.environ.get('PORT', 8080))
-        
-        logger.info("Starting Telegram File Bot...")
-        
-        # Start HTTP server in a separate thread for health checks
-        http_thread = threading.Thread(target=start_http_server, args=(PORT,), daemon=True)
-        http_thread.start()
-        
-        # Start the bot with polling - simplified approach
-        logger.info("Starting bot polling...")
-        application.run_polling()
+        # Start the bot
+        logger.info("Starting bot...")
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
         
     except Exception as e:
-        logger.error(f"Bot startup failed: {e}")
-        # Alternative startup without updater
-        import asyncio
-        
-        async def start_bot():
-            try:
-                from telegram.ext import Updater
-                # Manual bot setup without problematic updater
-                bot = application.bot
-                
-                # Simple polling loop
-                offset = 0
-                while True:
-                    try:
-                        updates = await bot.get_updates(offset=offset, timeout=10)
-                        for update in updates:
-                            offset = update.update_id + 1
-                            await application.process_update(update)
-                    except Exception as poll_error:
-                        logger.error(f"Polling error: {poll_error}")
-                        await asyncio.sleep(1)
-                        
-            except Exception as async_error:
-                logger.error(f"Async bot error: {async_error}")
-        
-        try:
-            asyncio.run(start_bot())
-        except KeyboardInterrupt:
-            logger.info("Bot stopped")
+        logger.error(f"Error running bot: {e}")
+        raise
+
+if __name__ == '__main__':
+    main()
