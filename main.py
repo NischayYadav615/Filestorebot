@@ -1073,47 +1073,51 @@ def start_http_server(port):
 
 def main():
     """Start the bot"""
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", handle_file_access))
-    application.add_handler(CommandHandler("upload", upload_command))
-    application.add_handler(CommandHandler("myfiles", my_files))
-    application.add_handler(CommandHandler("buystars", buy_stars))
-    application.add_handler(CommandHandler("redeem", redeem_code_command))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # File upload handlers
-    application.add_handler(MessageHandler(
-        filters.Document.ALL | filters.PHOTO | filters.VIDEO | 
-        filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL,
-        handle_file_upload
-    ))
-    
-    # Text message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
-    
-    # Callback query handler
-    application.add_handler(CallbackQueryHandler(callback_query_handler))
-    
-    # Payment handlers
-    application.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    
-    # Get port from environment variable or default to 8080
-    PORT = int(os.environ.get('PORT', 8080))
-    HOST = '0.0.0.0'
-    
-    logger.info(f"Starting Telegram File Bot on {HOST}:{PORT}...")
-    logger.info("Bot features: File sharing, Stars payment, Redeem codes, Multi-file support")
-    
-    # Start HTTP server in a separate thread for health checks
-    http_thread = threading.Thread(target=start_http_server, args=(PORT,), daemon=True)
-    http_thread.start()
-    
-    # Start the bot with polling
     try:
+        # Create application with proper configuration
+        application = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .build()
+        )
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("upload", upload_command))
+        application.add_handler(CommandHandler("myfiles", my_files))
+        application.add_handler(CommandHandler("buystars", buy_stars))
+        application.add_handler(CommandHandler("redeem", redeem_code_command))
+        application.add_handler(CommandHandler("help", help_command))
+        
+        # File upload handlers
+        application.add_handler(MessageHandler(
+            filters.Document.ALL | filters.PHOTO | filters.VIDEO | 
+            filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL,
+            handle_file_upload
+        ))
+        
+        # Text message handler
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+        
+        # Callback query handler
+        application.add_handler(CallbackQueryHandler(callback_query_handler))
+        
+        # Payment handlers
+        application.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
+        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+        
+        # Get port from environment variable or default to 8080
+        PORT = int(os.environ.get('PORT', 8080))
+        HOST = '0.0.0.0'
+        
+        logger.info(f"Starting Telegram File Bot on {HOST}:{PORT}...")
+        logger.info("Bot features: File sharing, Stars payment, Redeem codes, Multi-file support")
+        
+        # Start HTTP server in a separate thread for health checks
+        http_thread = threading.Thread(target=start_http_server, args=(PORT,), daemon=True)
+        http_thread.start()
+        
+        # Start the bot with polling
         logger.info("Starting Telegram bot polling...")
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
@@ -1121,6 +1125,7 @@ def main():
             poll_interval=1.0,
             timeout=10
         )
+        
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
