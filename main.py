@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Bot configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0)'
+MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
 DATABASE_NAME = os.getenv('DATABASE_NAME', 'filebot')
 PORT = int(os.getenv('PORT', 8080))
 
