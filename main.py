@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-import aiofiles
+import motor.motor_asyncio
+from pymongo import MongoClient
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, 
     LabeledPrice, PreCheckoutQuery, Message
@@ -27,20 +28,118 @@ logger = logging.getLogger(__name__)
 
 # Bot configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0)
+DATABASE_NAME = os.getenv('DATABASE_NAME', 'filebot')
 PORT = int(os.getenv('PORT', 8080))
 
-# Data storage (in production, use a proper database)
-files_db = {}  # file_id: file_data
-users_db = {}  # user_id: user_data
-redeem_codes = {}  # code: file_id
-user_credits = {}  # user_id: credits
+class MongoDBManager:
+    def __init__(self):
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URL)
+        self.db = self.client[DATABASE_NAME]
+        self.files_collection = self.db.files
+        self.users_collection = self.db.users
+        self.redeem_codes_collection = self.db.redeem_codes
+        
+    async def ensure_indexes(self):
+        """Create indexes for better performance"""
+        await self.files_collection.create_index("file_id", unique=True)
+        await self.files_collection.create_index("owner_id")
+        await self.users_collection.create_index("user_id", unique=True)
+        await self.redeem_codes_collection.create_index("code", unique=True)
+        await self.redeem_codes_collection.create_index(
+            "created_at", 
+            expireAfterSeconds=86400*30  # Expire after 30 days
+        )
+    
+    async def save_file(self, file_data: dict):
+        """Save file data to MongoDB"""
+        await self.files_collection.replace_one(
+            {"file_id": file_data["file_id"]},
+            file_data,
+            upsert=True
+        )
+    
+    async def get_file(self, file_id: str) -> Optional[dict]:
+        """Get file data from MongoDB"""
+        return await self.files_collection.find_one({"file_id": file_id})
+    
+    async def get_user_files(self, user_id: int, limit: int = 50) -> List[dict]:
+        """Get user's files"""
+        cursor = self.files_collection.find(
+            {"owner_id": user_id}
+        ).sort("upload_date", -1).limit(limit)
+        return await cursor.to_list(length=limit)
+    
+    async def save_user(self, user_data: dict):
+        """Save user data to MongoDB"""
+        await self.users_collection.replace_one(
+            {"user_id": user_data["user_id"]},
+            user_data,
+            upsert=True
+        )
+    
+    async def get_user(self, user_id: int) -> Optional[dict]:
+        """Get user data from MongoDB"""
+        return await self.users_collection.find_one({"user_id": user_id})
+    
+    async def update_user_credits(self, user_id: int, credits_delta: int):
+        """Update user credits"""
+        await self.users_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$inc": {"credits": credits_delta},
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "joined_date": datetime.utcnow(),
+                    "credits": 0
+                }
+            },
+            upsert=True
+        )
+    
+    async def get_user_credits(self, user_id: int) -> int:
+        """Get user credits"""
+        user = await self.get_user(user_id)
+        return user.get("credits", 0) if user else 0
+    
+    async def spend_credits(self, user_id: int, amount: int) -> bool:
+        """Spend user credits"""
+        result = await self.users_collection.update_one(
+            {"user_id": user_id, "credits": {"$gte": amount}},
+            {"$inc": {"credits": -amount}}
+        )
+        return result.modified_count > 0
+    
+    async def save_redeem_code(self, code: str, file_id: str):
+        """Save redeem code"""
+        await self.redeem_codes_collection.replace_one(
+            {"code": code},
+            {
+                "code": code,
+                "file_id": file_id,
+                "created_at": datetime.utcnow()
+            },
+            upsert=True
+        )
+    
+    async def get_redeem_code(self, code: str) -> Optional[dict]:
+        """Get redeem code data"""
+        return await self.redeem_codes_collection.find_one({"code": code})
+    
+    async def delete_redeem_code(self, code: str):
+        """Delete used redeem code"""
+        await self.redeem_codes_collection.delete_one({"code": code})
+    
+    async def increment_file_access(self, file_id: str):
+        """Increment file access count"""
+        await self.files_collection.update_one(
+            {"file_id": file_id},
+            {"$inc": {"access_count": 1}}
+        )
 
 class FileBot:
     def __init__(self):
-        self.files_db = files_db
-        self.users_db = users_db
-        self.redeem_codes = redeem_codes
-        self.user_credits = user_credits
+        self.db = MongoDBManager()
         
     def generate_file_id(self):
         return str(uuid.uuid4())
@@ -52,27 +151,9 @@ class FileBot:
         base_url = f"https://t.me/{os.getenv('BOT_USERNAME', 'your_bot')}?start=file_{file_id}_{stars_required}"
         return base_url
     
-    async def save_file_data(self, file_id: str, file_data: dict):
-        self.files_db[file_id] = file_data
-        # In production, save to database
-        
-    async def get_file_data(self, file_id: str) -> Optional[dict]:
-        return self.files_db.get(file_id)
-    
-    def add_user_credits(self, user_id: int, credits: int):
-        if user_id not in self.user_credits:
-            self.user_credits[user_id] = 0
-        self.user_credits[user_id] += credits
-    
-    def get_user_credits(self, user_id: int) -> int:
-        return self.user_credits.get(user_id, 0)
-    
-    def spend_credits(self, user_id: int, amount: int) -> bool:
-        current_credits = self.get_user_credits(user_id)
-        if current_credits >= amount:
-            self.user_credits[user_id] = current_credits - amount
-            return True
-        return False
+    async def initialize(self):
+        """Initialize database indexes"""
+        await self.db.ensure_indexes()
 
 file_bot = FileBot()
 
@@ -81,12 +162,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     user_id = update.effective_user.id
     
-    # Initialize user
-    if user_id not in file_bot.users_db:
-        file_bot.users_db[user_id] = {
-            'files': [],
-            'joined_date': datetime.now().isoformat()
+    # Initialize user if not exists
+    user = await file_bot.db.get_user(user_id)
+    if not user:
+        user_data = {
+            "user_id": user_id,
+            "username": update.effective_user.username,
+            "first_name": update.effective_user.first_name,
+            "joined_date": datetime.utcnow(),
+            "credits": 0
         }
+        await file_bot.db.save_user(user_data)
     
     if args and args[0].startswith('file_'):
         # Handle file access from link
@@ -97,7 +183,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_file_access(update, context, file_id, stars_required)
             return
     
-    welcome_text = """
+    user_credits = await file_bot.db.get_user_credits(user_id)
+    
+    welcome_text = f"""
 🤖 **File Storage Bot**
 
 Welcome! This bot allows you to:
@@ -113,8 +201,8 @@ Welcome! This bot allows you to:
 /redeem - Use a redeem code
 /help - Show this help message
 
-**Your Current Credits:** ⭐ {credits}
-    """.format(credits=file_bot.get_user_credits(user_id))
+**Your Current Credits:** ⭐ {user_credits}
+    """
     
     keyboard = [
         [InlineKeyboardButton("📁 Upload File", callback_data="upload_file")],
@@ -133,7 +221,7 @@ Welcome! This bot allows you to:
 async def handle_file_access(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, stars_required: int):
     """Handle file access from public link"""
     user_id = update.effective_user.id
-    file_data = await file_bot.get_file_data(file_id)
+    file_data = await file_bot.db.get_file(file_id)
     
     if not file_data:
         await update.message.reply_text("❌ File not found or has been removed.")
@@ -154,7 +242,7 @@ async def handle_file_access(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
     
     # Check if user has enough credits
-    user_credits = file_bot.get_user_credits(user_id)
+    user_credits = await file_bot.db.get_user_credits(user_id)
     
     access_text = f"""
 📁 **{file_name}**
@@ -185,6 +273,9 @@ async def send_file_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         file_id = file_data.get('telegram_file_id')
         caption = f"📁 **{file_data.get('name')}**\n📊 Size: {file_data.get('size')} bytes"
         
+        # Increment access count
+        await file_bot.db.increment_file_access(file_data['file_id'])
+        
         if file_data.get('type') == 'document':
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
@@ -213,12 +304,17 @@ async def send_file_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 caption=caption,
                 parse_mode=ParseMode.MARKDOWN
             )
-            
-        await update.callback_query.message.reply_text("✅ File sent successfully!")
         
+        # Handle both callback query and direct message
+        if hasattr(update, 'callback_query') and update.callback_query:
+            await update.callback_query.message.reply_text("✅ File sent successfully!")
+        else:
+            await update.message.reply_text("✅ File sent successfully!")
+            
     except Exception as e:
         logger.error(f"Error sending file: {e}")
-        await update.callback_query.message.reply_text("❌ Error sending file. Please try again.")
+        message_obj = update.callback_query.message if hasattr(update, 'callback_query') and update.callback_query else update.message
+        await message_obj.reply_text("❌ Error sending file. Please try again.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle uploaded documents"""
@@ -240,18 +336,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = file_bot.generate_file_id()
     
     file_data = {
-        'id': file_id,
+        'file_id': file_id,
         'telegram_file_id': file_info.file_id,
         'name': getattr(file_info, 'file_name', f'{file_type}_{file_id}'),
         'size': getattr(file_info, 'file_size', 0),
         'type': file_type,
         'owner_id': user_id,
-        'upload_date': datetime.now().isoformat(),
-        'access_count': 0
+        'upload_date': datetime.utcnow(),
+        'access_count': 0,
+        'price': 0  # Default free
     }
     
-    await file_bot.save_file_data(file_id, file_data)
-    file_bot.users_db[user_id]['files'].append(file_id)
+    await file_bot.db.save_file(file_data)
     
     text = f"""
 ✅ **File Uploaded Successfully!**
@@ -293,7 +389,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_user_files(query, context, user_id)
         
     elif data == "check_credits":
-        credits = file_bot.get_user_credits(user_id)
+        credits = await file_bot.db.get_user_credits(user_id)
         await query.message.reply_text(f"💳 **Your Credits:** ⭐ {credits}", parse_mode=ParseMode.MARKDOWN)
         
     elif data == "redeem_code":
@@ -332,7 +428,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_user_files(query, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Show user's uploaded files"""
-    user_files = file_bot.users_db.get(user_id, {}).get('files', [])
+    user_files = await file_bot.db.get_user_files(user_id, limit=10)
     
     if not user_files:
         await query.message.reply_text("📁 You haven't uploaded any files yet.")
@@ -341,21 +437,19 @@ async def show_user_files(query, context: ContextTypes.DEFAULT_TYPE, user_id: in
     text = "📋 **Your Files:**\n\n"
     keyboard = []
     
-    for file_id in user_files[-10:]:  # Show last 10 files
-        file_data = await file_bot.get_file_data(file_id)
-        if file_data:
-            text += f"📁 {file_data['name']}\n"
-            keyboard.append([InlineKeyboardButton(
-                f"📁 {file_data['name'][:30]}...", 
-                callback_data=f"file_details_{file_id}"
-            )])
+    for file_data in user_files:
+        text += f"📁 {file_data['name']}\n"
+        keyboard.append([InlineKeyboardButton(
+            f"📁 {file_data['name'][:30]}...", 
+            callback_data=f"file_details_{file_data['file_id']}"
+        )])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 async def show_file_details(query, context: ContextTypes.DEFAULT_TYPE, file_id: str):
     """Show detailed file information"""
-    file_data = await file_bot.get_file_data(file_id)
+    file_data = await file_bot.db.get_file(file_id)
     if not file_data:
         await query.message.reply_text("❌ File not found.")
         return
@@ -371,7 +465,7 @@ async def show_file_details(query, context: ContextTypes.DEFAULT_TYPE, file_id: 
 **Type:** {file_data['type']}
 **Price:** ⭐ {price} stars
 **Access Count:** {file_data.get('access_count', 0)}
-**Upload Date:** {file_data['upload_date'][:10]}
+**Upload Date:** {file_data['upload_date'].strftime('%Y-%m-%d %H:%M')}
 
 **Public Link:**
 `{link}`
@@ -388,13 +482,16 @@ async def show_file_details(query, context: ContextTypes.DEFAULT_TYPE, file_id: 
 
 async def set_file_price(query, context: ContextTypes.DEFAULT_TYPE, file_id: str, price: int):
     """Set file price"""
-    file_data = await file_bot.get_file_data(file_id)
+    file_data = await file_bot.db.get_file(file_id)
     if not file_data:
         await query.message.reply_text("❌ File not found.")
         return
     
-    file_data['price'] = price
-    await file_bot.save_file_data(file_id, file_data)
+    # Update price in database
+    await file_bot.db.files_collection.update_one(
+        {"file_id": file_id},
+        {"$set": {"price": price}}
+    )
     
     link = file_bot.create_file_link(file_id, price)
     
@@ -422,13 +519,13 @@ Share this link with others to let them access your file!
 
 async def generate_redeem_code(query, context: ContextTypes.DEFAULT_TYPE, file_id: str):
     """Generate redeem code for file"""
-    file_data = await file_bot.get_file_data(file_id)
+    file_data = await file_bot.db.get_file(file_id)
     if not file_data:
         await query.message.reply_text("❌ File not found.")
         return
     
     redeem_code = file_bot.generate_redeem_code()
-    file_bot.redeem_codes[redeem_code] = file_id
+    await file_bot.db.save_redeem_code(redeem_code, file_id)
     
     text = f"""
 🎫 **Redeem Code Generated!**
@@ -446,13 +543,12 @@ async def use_credits_for_file(query, context: ContextTypes.DEFAULT_TYPE, file_i
     """Use user credits to access file"""
     user_id = query.from_user.id
     
-    if file_bot.spend_credits(user_id, stars_required):
-        file_data = await file_bot.get_file_data(file_id)
+    if await file_bot.db.spend_credits(user_id, stars_required):
+        file_data = await file_bot.db.get_file(file_id)
         if file_data:
-            file_data['access_count'] = file_data.get('access_count', 0) + 1
             await send_file_to_user(query, context, file_data)
             
-            remaining_credits = file_bot.get_user_credits(user_id)
+            remaining_credits = await file_bot.db.get_user_credits(user_id)
             await query.message.reply_text(
                 f"✅ Access granted! ⭐ {stars_required} credits used.\n"
                 f"💳 Remaining credits: ⭐ {remaining_credits}"
@@ -464,7 +560,7 @@ async def use_credits_for_file(query, context: ContextTypes.DEFAULT_TYPE, file_i
 
 async def initiate_star_payment(query, context: ContextTypes.DEFAULT_TYPE, file_id: str, stars_required: int):
     """Initiate Telegram Stars payment"""
-    file_data = await file_bot.get_file_data(file_id)
+    file_data = await file_bot.db.get_file(file_id)
     if not file_data:
         await query.message.reply_text("❌ File not found.")
         return
@@ -506,12 +602,11 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         
         # Give user credits equal to stars paid
         user_id = update.effective_user.id
-        file_bot.add_user_credits(user_id, stars_paid)
+        await file_bot.db.update_user_credits(user_id, stars_paid)
         
         # Grant access to file
-        file_data = await file_bot.get_file_data(file_id)
+        file_data = await file_bot.db.get_file(file_id)
         if file_data:
-            file_data['access_count'] = file_data.get('access_count', 0) + 1
             await send_file_to_user(update, context, file_data)
             
             await update.message.reply_text(
@@ -531,30 +626,31 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     redeem_code = context.args[0].upper()
-    file_id = file_bot.redeem_codes.get(redeem_code)
+    redeem_data = await file_bot.db.get_redeem_code(redeem_code)
     
-    if not file_id:
+    if not redeem_data:
         await update.message.reply_text("❌ Invalid or expired redeem code.")
         return
     
-    file_data = await file_bot.get_file_data(file_id)
+    file_id = redeem_data['file_id']
+    file_data = await file_bot.db.get_file(file_id)
+    
     if not file_data:
         await update.message.reply_text("❌ File not found or has been removed.")
         return
     
     # Grant access
-    file_data['access_count'] = file_data.get('access_count', 0) + 1
     await send_file_to_user(update, context, file_data)
     
     # Remove used redeem code
-    del file_bot.redeem_codes[redeem_code]
+    await file_bot.db.delete_redeem_code(redeem_code)
     
     await update.message.reply_text(f"✅ Redeem code accepted! Access granted to: {file_data['name']}")
 
 async def credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user credits"""
     user_id = update.effective_user.id
-    credits = file_bot.get_user_credits(user_id)
+    credits = await file_bot.db.get_user_credits(user_id)
     
     await update.message.reply_text(
         f"💳 **Your Credits:** ⭐ {credits}\n\n"
@@ -580,13 +676,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2. Set pricing for your files (free or paid with Telegram Stars)
 3. Share the generated public links
 4. Generate redeem codes for free access
-5. Users can pay with Telegram Stars or use redeem codes
 
 **Features:**
-📁 File storage and sharing
+📁 File storage and sharing with MongoDB
 ⭐ Telegram Stars integration
 💳 Credit system
-🎫 Redeem codes
+🎫 Redeem codes with expiry
 📊 Access statistics
 
 For support: @NY_BOTS
@@ -598,12 +693,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Exception while handling an update: {context.error}")
 
-def main():
+async def main():
     """Start the bot"""
     try:
         if not BOT_TOKEN:
             logger.error("BOT_TOKEN environment variable not set")
             return
+        
+        # Initialize database
+        await file_bot.initialize()
         
         # Create application
         application = Application.builder().token(BOT_TOKEN).build()
@@ -626,13 +724,12 @@ def main():
         # Add error handler
         application.add_error_handler(error_handler)
         
-        logger.info("Starting bot...")
+        logger.info("Starting bot with MongoDB...")
         
         # Start the bot
-        application.run_polling(
+        await application.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            close_loop=False
+            drop_pending_updates=True
         )
         
     except Exception as e:
@@ -640,4 +737,4 @@ def main():
         raise
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
