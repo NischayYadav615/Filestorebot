@@ -1074,12 +1074,8 @@ def start_http_server(port):
 def main():
     """Start the bot"""
     try:
-        # Create application with proper configuration
-        application = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .build()
-        )
+        # Create application with minimal configuration
+        application = Application.builder().token(BOT_TOKEN).build()
         
         # Add handlers
         application.add_handler(CommandHandler("start", start))
@@ -1108,29 +1104,44 @@ def main():
         
         # Get port from environment variable or default to 8080
         PORT = int(os.environ.get('PORT', 8080))
-        HOST = '0.0.0.0'
         
-        logger.info(f"Starting Telegram File Bot on {HOST}:{PORT}...")
-        logger.info("Bot features: File sharing, Stars payment, Redeem codes, Multi-file support")
+        logger.info("Starting Telegram File Bot...")
         
         # Start HTTP server in a separate thread for health checks
         http_thread = threading.Thread(target=start_http_server, args=(PORT,), daemon=True)
         http_thread.start()
         
-        # Start the bot with polling
-        logger.info("Starting Telegram bot polling...")
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            poll_interval=1.0,
-            timeout=10
-        )
+        # Start the bot with polling - simplified approach
+        logger.info("Starting bot polling...")
+        application.run_polling()
         
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Error running bot: {e}")
-        raise
-
-if __name__ == '__main__':
-    main()
+        logger.error(f"Bot startup failed: {e}")
+        # Alternative startup without updater
+        import asyncio
+        
+        async def start_bot():
+            try:
+                from telegram.ext import Updater
+                # Manual bot setup without problematic updater
+                bot = application.bot
+                
+                # Simple polling loop
+                offset = 0
+                while True:
+                    try:
+                        updates = await bot.get_updates(offset=offset, timeout=10)
+                        for update in updates:
+                            offset = update.update_id + 1
+                            await application.process_update(update)
+                    except Exception as poll_error:
+                        logger.error(f"Polling error: {poll_error}")
+                        await asyncio.sleep(1)
+                        
+            except Exception as async_error:
+                logger.error(f"Async bot error: {async_error}")
+        
+        try:
+            asyncio.run(start_bot())
+        except KeyboardInterrupt:
+            logger.info("Bot stopped")
