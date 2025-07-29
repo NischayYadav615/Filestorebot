@@ -1,5 +1,12 @@
-python-telegram-bot==20.7
-aiofiles==23.2.1
+# Core dependencies
+flask==2.3.3
+pymongo==4.5.0
+pyrogram==2.0.106
+requests==2.31.0
+
+# Optional: For better performance and production deployment
+gunicorn==21.2.0
+motor==3.3.1
+
+# Development dependencies (optional)
 python-dotenv==1.0.0
-motor
-pymongo
