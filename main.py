@@ -1,20 +1,25 @@
 import os
-import json
-import uuid
 import logging
-import hashlib
-import threading
+import asyncio
+import secrets
+import string
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from flask import Flask, request, jsonify
-from pymongo import MongoClient
-from pyrogram import Client, types
-from pyrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Update,
+import json
+
+import telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebApp
+from telegram.ext import (
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    Application
 )
-import requests
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+import motor.motor_asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -23,968 +28,613 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
-API_ID = int(os.getenv('API_ID'))
-API_HASH = os.getenv('API_HASH')
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-BOT_USERNAME = os.getenv('BOT_USERNAME', 'your_bot')
-MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
-DATABASE_NAME = os.getenv('DATABASE_NAME', 'filebot')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # Your server URL for webhook
+# Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+DATABASE_NAME = "telegram_file_bot"
+PORT = int(os.getenv("PORT", 8080))
 
-class MongoDBManager:
-    def __init__(self):
-        self.client = MongoClient(MONGODB_URL)
-        self.db = self.client[DATABASE_NAME]
-        self.files_collection = self.db.files
-        self.users_collection = self.db.users
-        self.redeem_codes_collection = self.db.redeem_codes
-        
-    def ensure_indexes(self):
-        """Create indexes for better performance"""
-        self.files_collection.create_index("file_id", unique=True)
-        self.files_collection.create_index("owner_id")
-        self.users_collection.create_index("user_id", unique=True)
-        self.redeem_codes_collection.create_index("code", unique=True)
-        # MongoDB TTL index for redeem codes (expire after 30 days)
-        self.redeem_codes_collection.create_index(
-            "created_at", 
-            expireAfterSeconds=86400*30
-        )
-    
-    def save_file(self, file_data: dict):
-        """Save file data to MongoDB"""
-        self.files_collection.replace_one(
-            {"file_id": file_data["file_id"]},
-            file_data,
-            upsert=True
-        )
-    
-    def get_file(self, file_id: str) -> Optional[dict]:
-        """Get file data from MongoDB"""
-        return self.files_collection.find_one({"file_id": file_id})
-    
-    def get_user_files(self, user_id: int, limit: int = 50) -> List[dict]:
-        """Get user's files"""
-        return list(self.files_collection.find(
-            {"owner_id": user_id}
-        ).sort("upload_date", -1).limit(limit))
-    
-    def save_user(self, user_data: dict):
-        """Save user data to MongoDB"""
-        self.users_collection.replace_one(
-            {"user_id": user_data["user_id"]},
-            user_data,
-            upsert=True
-        )
-    
-    def get_user(self, user_id: int) -> Optional[dict]:
-        """Get user data from MongoDB"""
-        return self.users_collection.find_one({"user_id": user_id})
-    
-    def update_user_credits(self, user_id: int, credits_delta: int):
-        """Update user credits"""
-        self.users_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$inc": {"credits": credits_delta},
-                "$setOnInsert": {
-                    "user_id": user_id,
-                    "joined_date": datetime.utcnow(),
-                    "credits": 0
-                }
-            },
-            upsert=True
-        )
-    
-    def get_user_credits(self, user_id: int) -> int:
-        """Get user credits"""
-        user = self.get_user(user_id)
-        return user.get("credits", 0) if user else 0
-    
-    def spend_credits(self, user_id: int, amount: int) -> bool:
-        """Spend user credits"""
-        result = self.users_collection.update_one(
-            {"user_id": user_id, "credits": {"$gte": amount}},
-            {"$inc": {"credits": -amount}}
-        )
-        return result.modified_count > 0
-    
-    def save_redeem_code(self, code: str, file_id: str):
-        """Save redeem code"""
-        self.redeem_codes_collection.replace_one(
-            {"code": code},
-            {
-                "code": code,
-                "file_id": file_id,
-                "created_at": datetime.utcnow()
-            },
-            upsert=True
-        )
-    
-    def get_redeem_code(self, code: str) -> Optional[dict]:
-        """Get redeem code data"""
-        return self.redeem_codes_collection.find_one({"code": code})
-    
-    def delete_redeem_code(self, code: str):
-        """Delete used redeem code"""
-        self.redeem_codes_collection.delete_one({"code": code})
-    
-    def increment_file_access(self, file_id: str):
-        """Increment file access count"""
-        self.files_collection.update_one(
-            {"file_id": file_id},
-            {"$inc": {"access_count": 1}}
-        )
+# MongoDB setup
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
+db = client[DATABASE_NAME]
+
+# Collections
+users_collection = db.users
+files_collection = db.files
+transactions_collection = db.transactions
+redeem_codes_collection = db.redeem_codes
 
 class FileBot:
     def __init__(self):
-        self.db = MongoDBManager()
+        self.bot_username = None
+        self.admin_users = set()
         
-    def generate_file_id(self):
-        return str(uuid.uuid4())
-    
-    def generate_redeem_code(self):
-        return hashlib.md5(str(uuid.uuid4()).encode()).hexdigest()[:8].upper()
-    
-    def create_file_link(self, file_id: str, stars_required: int = 0):
-        base_url = f"https://t.me/{BOT_USERNAME}?start=file_{file_id}_{stars_required}"
-        return base_url
-    
-    def initialize(self):
-        """Initialize database indexes"""
-        self.db.ensure_indexes()
+    async def initialize(self, application):
+        """Initialize bot data"""
+        try:
+            bot_info = await application.bot.get_me()
+            self.bot_username = bot_info.username
+            logger.info(f"Bot initialized: @{self.bot_username}")
+        except Exception as e:
+            logger.error(f"Failed to initialize bot: {e}")
 
-# Initialize Flask app and bot
-app = Flask(__name__)
-file_bot = FileBot()
+    def generate_code(self, length=8):
+        """Generate random code"""
+        chars = string.ascii_uppercase + string.digits
+        return ''.join(secrets.choice(chars) for _ in range(length))
 
-class TelegramBot:
-    def __init__(self, token: str):
-        self.token = token
-        self.api_url = f"https://api.telegram.org/bot{token}"
-    
-    def send_message(self, chat_id: int, text: str, reply_markup=None, parse_mode="Markdown"):
-        """Send a message via Telegram Bot API"""
-        url = f"{self.api_url}/sendMessage"
-        data = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode
-        }
-        if reply_markup:
-            data["reply_markup"] = json.dumps(reply_markup)
-        
-        response = requests.post(url, json=data)
-        return response.json()
-    
-    def send_document(self, chat_id: int, document: str, caption: str = None):
-        """Send a document via Telegram Bot API"""
-        url = f"{self.api_url}/sendDocument"
-        data = {
-            "chat_id": chat_id,
-            "document": document,
-            "caption": caption,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=data)
-        return response.json()
-    
-    def send_photo(self, chat_id: int, photo: str, caption: str = None):
-        """Send a photo via Telegram Bot API"""
-        url = f"{self.api_url}/sendPhoto"
-        data = {
-            "chat_id": chat_id,
-            "photo": photo,
-            "caption": caption,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=data)
-        return response.json()
-    
-    def send_video(self, chat_id: int, video: str, caption: str = None):
-        """Send a video via Telegram Bot API"""
-        url = f"{self.api_url}/sendVideo"
-        data = {
-            "chat_id": chat_id,
-            "video": video,
-            "caption": caption,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=data)
-        return response.json()
-    
-    def answer_callback_query(self, callback_query_id: str, text: str = None):
-        """Answer a callback query"""
-        url = f"{self.api_url}/answerCallbackQuery"
-        data = {
-            "callback_query_id": callback_query_id,
-            "text": text
-        }
-        response = requests.post(url, json=data)
-        return response.json()
-    
-    def send_invoice(self, chat_id: int, title: str, description: str, payload: str, 
-                    currency: str, prices: list, start_parameter: str = None):
-        """Send an invoice"""
-        url = f"{self.api_url}/sendInvoice"
-        data = {
-            "chat_id": chat_id,
-            "title": title,
-            "description": description,
-            "payload": payload,
-            "provider_token": "",  # Empty for Telegram Stars
-            "currency": currency,
-            "prices": prices
-        }
-        if start_parameter:
-            data["start_parameter"] = start_parameter
-        
-        response = requests.post(url, json=data)
-        return response.json()
-
-bot = TelegramBot(BOT_TOKEN)
-
-def create_inline_keyboard(buttons):
-    """Create inline keyboard markup"""
-    return {
-        "inline_keyboard": buttons
-    }
-
-def handle_start_command(message):
-    """Handle /start command"""
-    user_id = message['from']['id']
-    chat_id = message['chat']['id']
-    
-    # Initialize user if not exists
-    user = file_bot.db.get_user(user_id)
-    if not user:
+    async def ensure_user_exists(self, user_id: int, username: str = None, first_name: str = None):
+        """Ensure user exists in database"""
         user_data = {
             "user_id": user_id,
-            "username": message['from'].get('username'),
-            "first_name": message['from'].get('first_name'),
-            "joined_date": datetime.utcnow(),
-            "credits": 0
+            "username": username,
+            "first_name": first_name,
+            "stars_balance": 0,
+            "files_uploaded": 0,
+            "joined_date": datetime.now(),
+            "last_active": datetime.now()
         }
-        file_bot.db.save_user(user_data)
-    
-    # Handle file access from link
-    text = message.get('text', '').split()
-    if len(text) > 1 and text[1].startswith('file_'):
-        parts = text[1].split('_')
-        if len(parts) >= 3:
-            file_id = parts[1]
-            stars_required = int(parts[2])
-            handle_file_access(chat_id, user_id, file_id, stars_required)
+        
+        await users_collection.update_one(
+            {"user_id": user_id},
+            {"$setOnInsert": user_data, "$set": {"last_active": datetime.now()}},
+            upsert=True
+        )
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        user = update.effective_user
+        await self.ensure_user_exists(user.id, user.username, user.first_name)
+        
+        # Check if it's a file access link
+        if context.args:
+            file_id = context.args[0]
+            await self.handle_file_access(update, context, file_id)
             return
-    
-    user_credits = file_bot.db.get_user_credits(user_id)
-    
-    welcome_text = f"""
-🤖 **File Storage Bot**
-
-Welcome! This bot allows you to:
-📁 Store files and generate public links
-⭐ Set Telegram Stars pricing for file access
-🎫 Generate redeem codes for free access
-💳 Manage your credits and files
-
-**Commands:**
-/myfiles - View your uploaded files
-/credits - Check your credit balance
-/redeem - Use a redeem code
-/help - Show this help message
-
-**Your Current Credits:** ⭐ {user_credits}
-    """
-    
-    keyboard = create_inline_keyboard([
-        [{"text": "📁 Upload File", "callback_data": "upload_file"}],
-        [{"text": "📋 My Files", "callback_data": "my_files"}],
-        [{"text": "⭐ My Credits", "callback_data": "check_credits"}],
-        [{"text": "🎫 Redeem Code", "callback_data": "redeem_code"}]
-    ])
-    
-    bot.send_message(chat_id, welcome_text, reply_markup=keyboard)
-
-def handle_file_access(chat_id: int, user_id: int, file_id: str, stars_required: int):
-    """Handle file access from public link"""
-    file_data = file_bot.db.get_file(file_id)
-    
-    if not file_data:
-        bot.send_message(chat_id, "❌ File not found or has been removed.")
-        return
-    
-    file_name = file_data.get('name', 'Unknown File')
-    file_size = file_data.get('size', 0)
-    owner_id = file_data.get('owner_id')
-    
-    if user_id == owner_id:
-        # Owner can access for free
-        send_file_to_user(chat_id, file_data)
-        return
-    
-    if stars_required == 0:
-        # Free file
-        send_file_to_user(chat_id, file_data)
-        return
-    
-    # Check if user has enough credits
-    user_credits = file_bot.db.get_user_credits(user_id)
-    
-    access_text = f"""
-📁 **{file_name}**
-📊 Size: {file_size} bytes
-💰 Cost: ⭐ {stars_required} stars
-💳 Your Credits: ⭐ {user_credits}
-
-Choose how to access this file:
-"""
-    
-    keyboard_buttons = []
-    
-    if user_credits >= stars_required:
-        keyboard_buttons.append([{"text": f"💳 Use Credits (⭐ {stars_required})", "callback_data": f"use_credits_{file_id}_{stars_required}"}])
-    
-    keyboard_buttons.extend([
-        [{"text": f"⭐ Buy with Telegram Stars (⭐ {stars_required})", "callback_data": f"buy_stars_{file_id}_{stars_required}"}],
-        [{"text": "🎫 I have a redeem code", "callback_data": f"redeem_for_file_{file_id}"}],
-        [{"text": "❌ Cancel", "callback_data": "cancel"}]
-    ])
-    
-    keyboard = create_inline_keyboard(keyboard_buttons)
-    bot.send_message(chat_id, access_text, reply_markup=keyboard)
-
-def send_file_to_user(chat_id: int, file_data: dict):
-    """Send file to user"""
-    try:
-        telegram_file_id = file_data.get('telegram_file_id')
-        caption = f"📁 **{file_data.get('name')}**\n📊 Size: {file_data.get('size')} bytes"
-        
-        # Increment access count
-        file_bot.db.increment_file_access(file_data['file_id'])
-        
-        file_type = file_data.get('type')
-        
-        if file_type == 'document':
-            bot.send_document(chat_id, telegram_file_id, caption)
-        elif file_type == 'photo':
-            bot.send_photo(chat_id, telegram_file_id, caption)
-        elif file_type == 'video':
-            bot.send_video(chat_id, telegram_file_id, caption)
-        else:
-            bot.send_document(chat_id, telegram_file_id, caption)
-        
-        bot.send_message(chat_id, "✅ File sent successfully!")
             
-    except Exception as e:
-        logger.error(f"Error sending file: {e}")
-        bot.send_message(chat_id, "❌ Error sending file. Please try again.")
+        welcome_text = f"""
+🎉 **Welcome to File Storage Bot!** 
 
-def handle_document_upload(message):
-    """Handle uploaded documents"""
-    user_id = message['from']['id']
-    chat_id = message['chat']['id']
-    
-    if 'document' in message:
-        file_info = message['document']
-        file_type = 'document'
-        file_name = file_info.get('file_name', f'document_{uuid.uuid4().hex[:8]}')
-        file_size = file_info.get('file_size', 0)
-        telegram_file_id = file_info['file_id']
-    elif 'photo' in message:
-        file_info = message['photo'][-1]  # Get highest resolution
-        file_type = 'photo'
-        file_name = f'photo_{uuid.uuid4().hex[:8]}.jpg'
-        file_size = file_info.get('file_size', 0)
-        telegram_file_id = file_info['file_id']
-    elif 'video' in message:
-        file_info = message['video']
-        file_type = 'video'
-        file_name = file_info.get('file_name', f'video_{uuid.uuid4().hex[:8]}.mp4')
-        file_size = file_info.get('file_size', 0)
-        telegram_file_id = file_info['file_id']
-    else:
-        bot.send_message(chat_id, "❌ Unsupported file type.")
-        return
-    
-    file_id = file_bot.generate_file_id()
-    
-    file_data = {
-        'file_id': file_id,
-        'telegram_file_id': telegram_file_id,
-        'name': file_name,
-        'size': file_size,
-        'type': file_type,
-        'owner_id': user_id,
-        'upload_date': datetime.utcnow(),
-        'access_count': 0,
-        'price': 0  # Default free
-    }
-    
-    file_bot.db.save_file(file_data)
-    
-    text = f"""
+📁 **Features:**
+• Upload and store files securely
+• Generate public access links
+• Set star prices for file access
+• Create redeem codes for free access
+• Earn stars from file sales
+
+💫 **Your Stats:**
+• Stars Balance: {await self.get_user_stars(user.id)} ⭐
+• Files Uploaded: {await self.get_user_files_count(user.id)}
+
+🚀 **Get Started:**
+Just send me any file to upload!
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("📁 My Files", callback_data="my_files")],
+            [InlineKeyboardButton("💫 Buy Stars", callback_data="buy_stars"),
+             InlineKeyboardButton("🎫 Redeem Code", callback_data="redeem_code")],
+            [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
+        ]
+        
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    async def handle_file_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle file uploads"""
+        user = update.effective_user
+        await self.ensure_user_exists(user.id, user.username, user.first_name)
+        
+        # Get file info
+        file_obj = None
+        file_name = None
+        file_size = 0
+        
+        if update.message.document:
+            file_obj = update.message.document
+            file_name = file_obj.file_name
+            file_size = file_obj.file_size
+        elif update.message.photo:
+            file_obj = update.message.photo[-1]  # Get highest quality
+            file_name = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            file_size = file_obj.file_size
+        elif update.message.video:
+            file_obj = update.message.video
+            file_name = file_obj.file_name or f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+            file_size = file_obj.file_size
+        elif update.message.audio:
+            file_obj = update.message.audio
+            file_name = file_obj.file_name or f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+            file_size = file_obj.file_size
+        else:
+            await update.message.reply_text("❌ Unsupported file type!")
+            return
+            
+        if file_size > 50 * 1024 * 1024:  # 50MB limit
+            await update.message.reply_text("❌ File too large! Maximum size is 50MB.")
+            return
+            
+        # Generate unique file ID
+        file_id = self.generate_code(12)
+        
+        # Store file info in database
+        file_data = {
+            "file_id": file_id,
+            "telegram_file_id": file_obj.file_id,
+            "file_name": file_name,
+            "file_size": file_size,
+            "owner_id": user.id,
+            "owner_username": user.username,
+            "upload_date": datetime.now(),
+            "access_count": 0,
+            "star_price": 0,  # Default free
+            "is_public": True,
+            "description": ""
+        }
+        
+        try:
+            await files_collection.insert_one(file_data)
+            
+            # Update user stats
+            await users_collection.update_one(
+                {"user_id": user.id},
+                {"$inc": {"files_uploaded": 1}}
+            )
+            
+            # Create access link
+            bot_username = self.bot_username or "your_bot"
+            access_link = f"https://t.me/{bot_username}?start={file_id}"
+            
+            keyboard = [
+                [InlineKeyboardButton("⚙️ Set Price", callback_data=f"set_price_{file_id}")],
+                [InlineKeyboardButton("🎫 Generate Redeem Code", callback_data=f"gen_redeem_{file_id}")],
+                [InlineKeyboardButton("📊 File Stats", callback_data=f"file_stats_{file_id}")],
+                [InlineKeyboardButton("🔗 Share Link", url=access_link)]
+            ]
+            
+            success_text = f"""
 ✅ **File Uploaded Successfully!**
 
-📁 **File:** {file_data['name']}
-📊 **Size:** {file_data['size']} bytes
-🆔 **File ID:** `{file_id}`
+📁 **File:** {file_name}
+📏 **Size:** {self.format_file_size(file_size)}
+🔗 **Access Link:** `{access_link}`
+💰 **Current Price:** Free
 
-Now set the pricing for your file:
-"""
-    
-    keyboard = create_inline_keyboard([
-        [{"text": "🆓 Make it Free", "callback_data": f"set_price_{file_id}_0"}],
-        [{"text": "⭐ 1 Star", "callback_data": f"set_price_{file_id}_1"}],
-        [{"text": "⭐ 5 Stars", "callback_data": f"set_price_{file_id}_5"}],
-        [{"text": "⭐ 10 Stars", "callback_data": f"set_price_{file_id}_10"}],
-        [{"text": "💰 Custom Price", "callback_data": f"custom_price_{file_id}"}]
-    ])
-    
-    bot.send_message(chat_id, text, reply_markup=keyboard)
-
-def handle_callback_query(callback_query):
-    """Handle button callbacks"""
-    query_id = callback_query['id']
-    data = callback_query['data']
-    user_id = callback_query['from']['id']
-    chat_id = callback_query['message']['chat']['id']
-    
-    bot.answer_callback_query(query_id)
-    
-    if data == "upload_file":
-        bot.send_message(
-            chat_id,
-            "📁 **Upload a File**\n\n"
-            "Send me any file (document, photo, video) and I'll store it for you!"
-        )
-        
-    elif data == "my_files":
-        show_user_files(chat_id, user_id)
-        
-    elif data == "check_credits":
-        credits = file_bot.db.get_user_credits(user_id)
-        bot.send_message(chat_id, f"💳 **Your Credits:** ⭐ {credits}")
-        
-    elif data == "redeem_code":
-        bot.send_message(
-            chat_id,
-            "🎫 **Redeem Code**\n\n"
-            "Send me your redeem code to access a file for free!\n"
-            "Use format: `/redeem YOUR_CODE`"
-        )
-        
-    elif data.startswith("set_price_"):
-        parts = data.split("_")
-        file_id = parts[2]
-        price = int(parts[3])
-        set_file_price(chat_id, file_id, price)
-        
-    elif data.startswith("use_credits_"):
-        parts = data.split("_")
-        file_id = parts[2]
-        stars_required = int(parts[3])
-        use_credits_for_file(chat_id, user_id, file_id, stars_required)
-        
-    elif data.startswith("buy_stars_"):
-        parts = data.split("_")
-        file_id = parts[2]
-        stars_required = int(parts[3])
-        initiate_star_payment(chat_id, file_id, stars_required)
-        
-    elif data.startswith("generate_redeem_"):
-        file_id = data.split("_")[2]
-        generate_redeem_code(chat_id, file_id)
-        
-    elif data.startswith("file_details_"):
-        file_id = data.split("_")[2]
-        show_file_details(chat_id, file_id)
-
-def show_user_files(chat_id: int, user_id: int):
-    """Show user's uploaded files"""
-    user_files = file_bot.db.get_user_files(user_id, limit=10)
-    
-    if not user_files:
-        bot.send_message(chat_id, "📁 You haven't uploaded any files yet.")
-        return
-    
-    text = "📋 **Your Files:**\n\n"
-    keyboard_buttons = []
-    
-    for file_data in user_files:
-        text += f"📁 {file_data['name']}\n"
-        keyboard_buttons.append([{"text": f"📁 {file_data['name'][:30]}...", "callback_data": f"file_details_{file_data['file_id']}"}])
-    
-    keyboard = create_inline_keyboard(keyboard_buttons)
-    bot.send_message(chat_id, text, reply_markup=keyboard)
-
-def show_file_details(chat_id: int, file_id: str):
-    """Show detailed file information"""
-    file_data = file_bot.db.get_file(file_id)
-    if not file_data:
-        bot.send_message(chat_id, "❌ File not found.")
-        return
-    
-    price = file_data.get('price', 0)
-    link = file_bot.create_file_link(file_id, price)
-    
-    text = f"""
-📁 **File Details**
-
-**Name:** {file_data['name']}
-**Size:** {file_data['size']} bytes
-**Type:** {file_data['type']}
-**Price:** ⭐ {price} stars
-**Access Count:** {file_data.get('access_count', 0)}
-**Upload Date:** {file_data['upload_date'].strftime('%Y-%m-%d %H:%M')}
-
-**Public Link:**
-`{link}`
-"""
-    
-    keyboard = create_inline_keyboard([
-        [{"text": "🎫 Generate Redeem Code", "callback_data": f"generate_redeem_{file_id}"}],
-        [{"text": "💰 Change Price", "callback_data": f"change_price_{file_id}"}],
-        [{"text": "📊 View Stats", "callback_data": f"file_stats_{file_id}"}]
-    ])
-    
-    bot.send_message(chat_id, text, reply_markup=keyboard)
-
-def set_file_price(chat_id: int, file_id: str, price: int):
-    """Set file price"""
-    file_data = file_bot.db.get_file(file_id)
-    if not file_data:
-        bot.send_message(chat_id, "❌ File not found.")
-        return
-    
-    # Update price in database
-    file_bot.db.files_collection.update_one(
-        {"file_id": file_id},
-        {"$set": {"price": price}}
-    )
-    
-    link = file_bot.create_file_link(file_id, price)
-    
-    price_text = "🆓 Free" if price == 0 else f"⭐ {price} stars"
-    
-    text = f"""
-✅ **Price Set Successfully!**
-
-📁 **File:** {file_data['name']}
-💰 **Price:** {price_text}
-
-**Public Link:**
-`{link}`
-
-Share this link with others to let them access your file!
-"""
-    
-    keyboard = create_inline_keyboard([
-        [{"text": "🎫 Generate Redeem Code", "callback_data": f"generate_redeem_{file_id}"}],
-        [{"text": "📋 Back to My Files", "callback_data": "my_files"}]
-    ])
-    
-    bot.send_message(chat_id, text, reply_markup=keyboard)
-
-def generate_redeem_code(chat_id: int, file_id: str):
-    """Generate redeem code for file"""
-    file_data = file_bot.db.get_file(file_id)
-    if not file_data:
-        bot.send_message(chat_id, "❌ File not found.")
-        return
-    
-    redeem_code = file_bot.generate_redeem_code()
-    file_bot.db.save_redeem_code(redeem_code, file_id)
-    
-    text = f"""
-🎫 **Redeem Code Generated!**
-
-📁 **File:** {file_data['name']}
-🎫 **Code:** `{redeem_code}`
-
-Give this code to users for free access to your file.
-Users can use it with: `/redeem {redeem_code}`
-"""
-    
-    bot.send_message(chat_id, text)
-
-def use_credits_for_file(chat_id: int, user_id: int, file_id: str, stars_required: int):
-    """Use user credits to access file"""
-    if file_bot.db.spend_credits(user_id, stars_required):
-        file_data = file_bot.db.get_file(file_id)
-        if file_data:
-            send_file_to_user(chat_id, file_data)
+You can set a star price or generate redeem codes using the buttons below.
+            """
             
-            remaining_credits = file_bot.db.get_user_credits(user_id)
-            bot.send_message(
-                chat_id,
-                f"✅ Access granted! ⭐ {stars_required} credits used.\n"
-                f"💳 Remaining credits: ⭐ {remaining_credits}"
+            await update.message.reply_text(
+                success_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
+            
+        except Exception as e:
+            logger.error(f"Error storing file: {e}")
+            await update.message.reply_text("❌ Error uploading file. Please try again.")
+
+    async def handle_file_access(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+        """Handle file access via link"""
+        user = update.effective_user
+        await self.ensure_user_exists(user.id, user.username, user.first_name)
+        
+        # Get file info
+        file_data = await files_collection.find_one({"file_id": file_id})
+        if not file_data:
+            await update.message.reply_text("❌ File not found or has been removed.")
+            return
+            
+        # Check if user is owner
+        if file_data["owner_id"] == user.id:
+            await self.send_file_to_user(update, file_data)
+            return
+            
+        # Check if file is free
+        if file_data["star_price"] == 0:
+            await self.send_file_to_user(update, file_data)
+            await files_collection.update_one(
+                {"file_id": file_id},
+                {"$inc": {"access_count": 1}}
+            )
+            return
+            
+        # File requires stars
+        user_stars = await self.get_user_stars(user.id)
+        required_stars = file_data["star_price"]
+        
+        if user_stars >= required_stars:
+            keyboard = [
+                [InlineKeyboardButton(f"💫 Pay {required_stars} Stars", callback_data=f"pay_stars_{file_id}")],
+                [InlineKeyboardButton("🎫 Enter Redeem Code", callback_data=f"redeem_file_{file_id}")],
+                [InlineKeyboardButton("💫 Buy More Stars", callback_data="buy_stars")]
+            ]
         else:
-            bot.send_message(chat_id, "❌ File not found.")
-    else:
-        bot.send_message(chat_id, "❌ Insufficient credits.")
+            keyboard = [
+                [InlineKeyboardButton("🎫 Enter Redeem Code", callback_data=f"redeem_file_{file_id}")],
+                [InlineKeyboardButton("💫 Buy Stars", callback_data="buy_stars")]
+            ]
+            
+        access_text = f"""
+📁 **{file_data['file_name']}**
+📏 **Size:** {self.format_file_size(file_data['file_size'])}
+👤 **Owner:** @{file_data['owner_username'] or 'Anonymous'}
 
-def initiate_star_payment(chat_id: int, file_id: str, stars_required: int):
-    """Initiate Telegram Stars payment"""
-    file_data = file_bot.db.get_file(file_id)
-    if not file_data:
-        bot.send_message(chat_id, "❌ File not found.")
-        return
-    
-    title = f"Access to {file_data['name']}"
-    description = f"Pay {stars_required} Telegram Stars to access this file"
-    payload = f"file_access_{file_id}_{stars_required}"
-    
-    prices = [{"label": "File Access", "amount": stars_required}]
-    
-    try:
-        bot.send_invoice(
-            chat_id=chat_id,
-            title=title,
-            description=description,
-            payload=payload,
-            currency="XTR",  # Telegram Stars currency
-            prices=prices,
-            start_parameter=f"file_{file_id}",
+💰 **Price:** {required_stars} ⭐
+💫 **Your Stars:** {user_stars} ⭐
+
+{f"✅ You can afford this file!" if user_stars >= required_stars else "❌ You need more stars!"}
+        """
+        
+        await update.message.reply_text(
+            access_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-    except Exception as e:
-        logger.error(f"Error creating invoice: {e}")
-        bot.send_message(chat_id, "❌ Error creating payment. Please try again.")
 
-def handle_redeem_command(message):
-    """Handle redeem code command"""
-    chat_id = message['chat']['id']
-    text = message.get('text', '').split()
-    
-    if len(text) < 2:
-        bot.send_message(
-            chat_id,
-            "🎫 **Redeem Code**\n\n"
-            "Usage: `/redeem YOUR_CODE`\n"
-            "Example: `/redeem ABC123XY`"
+    async def send_file_to_user(self, update: Update, file_data: dict):
+        """Send file to user"""
+        try:
+            caption = f"📁 {file_data['file_name']}\n👤 Shared by @{file_data['owner_username'] or 'Anonymous'}"
+            
+            if file_data['file_name'].lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
+                await update.effective_chat.send_photo(
+                    photo=file_data['telegram_file_id'],
+                    caption=caption
+                )
+            elif file_data['file_name'].lower().endswith(('.mp4', '.avi', '.mov')):
+                await update.effective_chat.send_video(
+                    video=file_data['telegram_file_id'],
+                    caption=caption
+                )
+            elif file_data['file_name'].lower().endswith(('.mp3', '.wav', '.ogg')):
+                await update.effective_chat.send_audio(
+                    audio=file_data['telegram_file_id'],
+                    caption=caption
+                )
+            else:
+                await update.effective_chat.send_document(
+                    document=file_data['telegram_file_id'],
+                    caption=caption
+                )
+                
+        except Exception as e:
+            logger.error(f"Error sending file: {e}")
+            await update.effective_chat.send_message("❌ Error accessing file. File may have been removed.")
+
+    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle callback queries"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        user = update.effective_user
+        
+        if data == "my_files":
+            await self.show_user_files(update, context)
+        elif data == "buy_stars":
+            await self.show_buy_stars(update, context)
+        elif data == "redeem_code":
+            await self.show_redeem_code_input(update, context)
+        elif data == "help":
+            await self.show_help(update, context)
+        elif data.startswith("set_price_"):
+            file_id = data.split("_", 2)[2]
+            await self.show_set_price(update, context, file_id)
+        elif data.startswith("gen_redeem_"):
+            file_id = data.split("_", 2)[2]
+            await self.generate_redeem_code(update, context, file_id)
+        elif data.startswith("pay_stars_"):
+            file_id = data.split("_", 2)[2]
+            await self.process_star_payment(update, context, file_id)
+        elif data.startswith("redeem_file_"):
+            file_id = data.split("_", 2)[2]
+            context.user_data["redeem_file_id"] = file_id
+            await query.edit_message_text("🎫 Please enter your redeem code:")
+        elif data.startswith("buy_stars_"):
+            amount = int(data.split("_")[2])
+            await self.create_star_invoice(update, context, amount)
+
+    async def show_user_files(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user's uploaded files"""
+        user = update.effective_user
+        
+        files = await files_collection.find({"owner_id": user.id}).sort("upload_date", -1).limit(10).to_list(None)
+        
+        if not files:
+            await update.callback_query.edit_message_text("📁 You haven't uploaded any files yet.")
+            return
+            
+        text = "📁 **Your Files:**\n\n"
+        keyboard = []
+        
+        for file_data in files:
+            text += f"• {file_data['file_name']}\n"
+            text += f"  💰 Price: {file_data['star_price']} ⭐\n"
+            text += f"  👁 Views: {file_data['access_count']}\n\n"
+            
+            keyboard.append([InlineKeyboardButton(
+                f"⚙️ {file_data['file_name'][:20]}...",
+                callback_data=f"file_stats_{file_data['file_id']}"
+            )])
+            
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="start")])
+        
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-        return
-    
-    redeem_code = text[1].upper()
-    redeem_data = file_bot.db.get_redeem_code(redeem_code)
-    
-    if not redeem_data:
-        bot.send_message(chat_id, "❌ Invalid or expired redeem code.")
-        return
-    
-    file_id = redeem_data['file_id']
-    file_data = file_bot.db.get_file(file_id)
-    
-    if not file_data:
-        bot.send_message(chat_id, "❌ File not found or has been removed.")
-        return
-    
-    # Grant access
-    send_file_to_user(chat_id, file_data)
-    
-    # Remove used redeem code
-    file_bot.db.delete_redeem_code(redeem_code)
-    
-    bot.send_message(chat_id, f"✅ Redeem code accepted! Access granted to: {file_data['name']}")
 
-def handle_credits_command(message):
-    """Show user credits"""
-    user_id = message['from']['id']
-    chat_id = message['chat']['id']
-    credits = file_bot.db.get_user_credits(user_id)
-    
-    bot.send_message(
-        chat_id,
-        f"💳 **Your Credits:** ⭐ {credits}\n\n"
-        "Credits can be used to access paid files without additional payment."
-    )
+    async def show_buy_stars(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show star purchase options"""
+        text = """
+💫 **Buy Telegram Stars**
 
-def handle_myfiles_command(message):
-    """Show user's files"""
-    user_id = message['from']['id']
-    chat_id = message['chat']['id']
-    show_user_files(chat_id, user_id)
+Choose how many stars you want to purchase:
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("⭐ 10 Stars", callback_data="buy_stars_10")],
+            [InlineKeyboardButton("⭐ 25 Stars", callback_data="buy_stars_25")],
+            [InlineKeyboardButton("⭐ 50 Stars", callback_data="buy_stars_50")],
+            [InlineKeyboardButton("⭐ 100 Stars", callback_data="buy_stars_100")],
+            [InlineKeyboardButton("🔙 Back", callback_data="start")]
+        ]
+        
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
-def handle_help_command(message):
-    """Show help message"""
-    chat_id = message['chat']['id']
-    help_text = """
+    async def create_star_invoice(self, update: Update, context: ContextTypes.DEFAULT_TYPE, stars: int):
+        """Create a star payment invoice"""
+        try:
+            # Create invoice for star payment
+            await context.bot.send_invoice(
+                chat_id=update.effective_chat.id,
+                title=f"Buy {stars} Telegram Stars",
+                description=f"Purchase {stars} stars for accessing premium files",
+                payload=f"stars_{stars}_{update.effective_user.id}",
+                provider_token="",  # Empty for stars
+                currency="XTR",  # Telegram Stars currency
+                prices=[{"label": f"{stars} Stars", "amount": stars}],
+                max_tip_amount=0,
+                suggested_tip_amounts=[],
+                photo_url=None,
+                photo_size=None,
+                photo_width=None,
+                photo_height=None,
+                need_name=False,
+                need_phone_number=False,
+                need_email=False,
+                need_shipping_address=False,
+                send_phone_number_to_provider=False,
+                send_email_to_provider=False,
+                is_flexible=False
+            )
+        except Exception as e:
+            logger.error(f"Error creating star invoice: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Unable to create payment. This feature requires proper bot configuration."
+            )
+
+    async def show_redeem_code_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show redeem code input"""
+        context.user_data["awaiting_redeem_code"] = True
+        await update.callback_query.edit_message_text(
+            "🎫 **Enter Redeem Code**\n\nPlease type your redeem code:"
+        )
+
+    async def handle_redeem_code(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle redeem code input"""
+        if not context.user_data.get("awaiting_redeem_code") and not context.user_data.get("redeem_file_id"):
+            return
+            
+        code = update.message.text.strip().upper()
+        user = update.effective_user
+        
+        # Find redeem code
+        redeem_data = await redeem_codes_collection.find_one({"code": code, "is_used": False})
+        
+        if not redeem_data:
+            await update.message.reply_text("❌ Invalid or expired redeem code!")
+            return
+            
+        # Check if it's for a specific file
+        if context.user_data.get("redeem_file_id"):
+            file_id = context.user_data["redeem_file_id"]
+            if redeem_data.get("file_id") and redeem_data["file_id"] != file_id:
+                await update.message.reply_text("❌ This redeem code is not valid for this file!")
+                return
+                
+        # Process redemption
+        if redeem_data.get("file_id"):
+            # File access redeem code
+            file_data = await files_collection.find_one({"file_id": redeem_data["file_id"]})
+            if file_data:
+                await self.send_file_to_user(update, file_data)
+                await update.message.reply_text("✅ File accessed successfully!")
+                
+                # Mark code as used
+                await redeem_codes_collection.update_one(
+                    {"code": code},
+                    {"$set": {"is_used": True, "used_by": user.id, "used_date": datetime.now()}}
+                )
+        elif redeem_data.get("stars"):
+            # Stars redeem code
+            stars = redeem_data["stars"]
+            await users_collection.update_one(
+                {"user_id": user.id},
+                {"$inc": {"stars_balance": stars}}
+            )
+            
+            await update.message.reply_text(f"✅ Redeemed {stars} ⭐ stars successfully!")
+            
+            # Mark code as used
+            await redeem_codes_collection.update_one(
+                {"code": code},
+                {"$set": {"is_used": True, "used_by": user.id, "used_date": datetime.now()}}
+            )
+            
+        # Clear user data
+        context.user_data.pop("awaiting_redeem_code", None)
+        context.user_data.pop("redeem_file_id", None)
+
+    async def generate_redeem_code(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+        """Generate redeem code for file"""
+        user = update.effective_user
+        
+        # Verify file ownership
+        file_data = await files_collection.find_one({"file_id": file_id, "owner_id": user.id})
+        if not file_data:
+            await update.callback_query.edit_message_text("❌ File not found or you don't own this file.")
+            return
+            
+        # Generate redeem code
+        code = self.generate_code(8)
+        
+        redeem_data = {
+            "code": code,
+            "file_id": file_id,
+            "created_by": user.id,
+            "created_date": datetime.now(),
+            "is_used": False,
+            "expires_date": datetime.now() + timedelta(days=30)  # 30 days validity
+        }
+        
+        try:
+            await redeem_codes_collection.insert_one(redeem_data)
+            
+            text = f"""
+✅ **Redeem Code Generated!**
+
+🎫 **Code:** `{code}`
+📁 **File:** {file_data['file_name']}
+⏰ **Valid Until:** {redeem_data['expires_date'].strftime('%Y-%m-%d')}
+
+Share this code with others to give them free access to your file!
+            """
+            
+            await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error generating redeem code: {e}")
+            await update.callback_query.edit_message_text("❌ Error generating redeem code.")
+
+    async def get_user_stars(self, user_id: int) -> int:
+        """Get user's star balance"""
+        user_data = await users_collection.find_one({"user_id": user_id})
+        return user_data.get("stars_balance", 0) if user_data else 0
+
+    async def get_user_files_count(self, user_id: int) -> int:
+        """Get user's uploaded files count"""
+        return await files_collection.count_documents({"owner_id": user_id})
+
+    def format_file_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        if size_bytes == 0:
+            return "0B"
+        size_names = ["B", "KB", "MB", "GB"]
+        i = 0
+        while size_bytes >= 1024 and i < len(size_names) - 1:
+            size_bytes /= 1024.0
+            i += 1
+        return f"{size_bytes:.1f}{size_names[i]}"
+
+    async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show help information"""
+        help_text = """
 🤖 **File Storage Bot Help**
 
+**📤 Uploading Files:**
+• Send any file (document, photo, video, audio)
+• Get a shareable link instantly
+• Set star prices for premium access
+
+**💰 Earning Stars:**
+• Set prices on your files
+• Earn stars when people buy access
+• Generate free redeem codes for friends
+
+**💫 Using Stars:**
+• Buy stars to access premium files
+• Use redeem codes for free access
+• Check your balance anytime
+
+**🎫 Redeem Codes:**
+• Get free access to premium files
+• Valid for 30 days after creation
+• One-time use only
+
 **Commands:**
-/start - Start the bot and see main menu
-/myfiles - View your uploaded files
-/credits - Check your credit balance
-/redeem CODE - Use a redeem code
-/help - Show this help message
+• /start - Main menu
+• Send file - Upload new file
+• Send redeem code - Redeem code
 
-**How to use:**
-1. Upload files by sending them directly to the bot
-2. Set pricing for your files (free or paid with Telegram Stars)
-3. Share the generated public links
-4. Generate redeem codes for free access
-
-**Features:**
-📁 File storage and sharing with MongoDB
-⭐ Telegram Stars integration
-💳 Credit system
-🎫 Redeem codes with expiry
-📊 Access statistics
-
-**Supported file types:**
-📄 Documents (PDF, DOC, etc.)
-📷 Photos (JPG, PNG, etc.)
-🎥 Videos (MP4, AVI, etc.)
-
-For support: @NY_BOTS
-"""
-    
-    bot.send_message(chat_id, help_text)
-
-def handle_successful_payment(message):
-    """Handle successful payment"""
-    payment = message['successful_payment']
-    payload_parts = payment['invoice_payload'].split("_")
-    
-    if len(payload_parts) >= 3 and payload_parts[0] == "file" and payload_parts[1] == "access":
-        file_id = payload_parts[2]
-        stars_paid = int(payload_parts[3])
+Need more help? Contact @NY_BOTS
+        """
         
-        # Give user credits equal to stars paid
-        user_id = message['from']['id']
-        chat_id = message['chat']['id']
-        file_bot.db.update_user_credits(user_id, stars_paid)
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="start")]]
         
-        # Grant access to file
-        file_data = file_bot.db.get_file(file_id)
-        if file_data:
-            send_file_to_user(chat_id, file_data)
-            
-            bot.send_message(
-                chat_id,
-                f"✅ Payment successful! File access granted.\n"
-                f"💳 {stars_paid} credits added to your account."
-            )
+        await update.callback_query.edit_message_text(
+            help_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
-# Flask routes
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Handle incoming webhook updates from Telegram"""
+file_bot = FileBot()
+
+async def main():
+    """Start the bot"""
     try:
-        update = request.get_json()
-        
-        if 'message' in update:
-            message = update['message']
-            
-            # Handle commands
-            if 'text' in message and message['text'].startswith('/'):
-                command = message['text'].split()[0]
-                
-                if command == '/start':
-                    handle_start_command(message)
-                elif command == '/help':
-                    handle_help_command(message)
-                elif command == '/credits':
-                    handle_credits_command(message)
-                elif command == '/redeem':
-                    handle_redeem_command(message)
-                elif command == '/myfiles':
-                    handle_myfiles_command(message)
-            
-            # Handle file uploads
-            elif any(key in message for key in ['document', 'photo', 'video']):
-                handle_document_upload(message)
-            
-            # Handle successful payment
-            elif 'successful_payment' in message:
-                handle_successful_payment(message)
-        
-        # Handle callback queries
-        elif 'callback_query' in update:
-            handle_callback_query(update['callback_query'])
-        
-        # Handle pre-checkout query
-        elif 'pre_checkout_query' in update:
-            pre_checkout_query = update['pre_checkout_query']
-            # Auto-approve all pre-checkout queries
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerPreCheckoutQuery"
-            data = {
-                "pre_checkout_query_id": pre_checkout_query['id'],
-                "ok": True
-            }
-            requests.post(url, json=data)
-        
-        return jsonify({"status": "ok"})
-    
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
-
-@app.route('/stats', methods=['GET'])
-def get_stats():
-    """Get bot statistics"""
-    try:
-        total_files = file_bot.db.files_collection.count_documents({})
-        total_users = file_bot.db.users_collection.count_documents({})
-        total_redeem_codes = file_bot.db.redeem_codes_collection.count_documents({})
-        
-        # Get total access count
-        pipeline = [
-            {"$group": {"_id": None, "total_accesses": {"$sum": "$access_count"}}}
-        ]
-        access_result = list(file_bot.db.files_collection.aggregate(pipeline))
-        total_accesses = access_result[0]['total_accesses'] if access_result else 0
-        
-        return jsonify({
-            "total_files": total_files,
-            "total_users": total_users,
-            "total_redeem_codes": total_redeem_codes,
-            "total_accesses": total_accesses,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/files/<file_id>', methods=['GET'])
-def get_file_info(file_id):
-    """Get file information"""
-    try:
-        file_data = file_bot.db.get_file(file_id)
-        if not file_data:
-            return jsonify({"error": "File not found"}), 404
-        
-        # Remove sensitive data
-        safe_file_data = {
-            "file_id": file_data['file_id'],
-            "name": file_data['name'],
-            "size": file_data['size'],
-            "type": file_data['type'],
-            "price": file_data.get('price', 0),
-            "access_count": file_data.get('access_count', 0),
-            "upload_date": file_data['upload_date'].isoformat()
-        }
-        
-        return jsonify(safe_file_data)
-    except Exception as e:
-        logger.error(f"Error getting file info: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/set_webhook', methods=['POST'])
-def set_webhook():
-    """Set webhook URL for the bot"""
-    try:
-        webhook_url = request.json.get('webhook_url')
-        if not webhook_url:
-            return jsonify({"error": "webhook_url is required"}), 400
-        
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-        data = {
-            "url": webhook_url,
-            "allowed_updates": ["message", "callback_query", "pre_checkout_query"]
-        }
-        
-        response = requests.post(url, json=data)
-        result = response.json()
-        
-        if result.get('ok'):
-            return jsonify({"status": "success", "message": "Webhook set successfully"})
-        else:
-            return jsonify({"status": "error", "message": result.get('description', 'Unknown error')}), 400
-    
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/delete_webhook', methods=['POST'])
-def delete_webhook():
-    """Delete webhook for the bot"""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        response = requests.post(url)
-        result = response.json()
-        
-        if result.get('ok'):
-            return jsonify({"status": "success", "message": "Webhook deleted successfully"})
-        else:
-            return jsonify({"status": "error", "message": result.get('description', 'Unknown error')}), 400
-    
-    except Exception as e:
-        logger.error(f"Error deleting webhook: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/webhook_info', methods=['GET'])
-def webhook_info():
-    """Get webhook information"""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
-        response = requests.get(url)
-        result = response.json()
-        
-        if result.get('ok'):
-            return jsonify(result['result'])
-        else:
-            return jsonify({"error": result.get('description', 'Unknown error')}), 400
-    
-    except Exception as e:
-        logger.error(f"Error getting webhook info: {e}")
-        return jsonify({"error": str(e)}), 500
-
-def initialize_bot():
-    """Initialize the bot and database"""
-    try:
-        # Initialize database
-        file_bot.initialize()
-        logger.info("Database initialized successfully")
-        
-        # Set webhook if WEBHOOK_URL is provided
-        if WEBHOOK_URL:
-            webhook_url = f"{WEBHOOK_URL}/webhook"
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-            data = {
-                "url": webhook_url,
-                "allowed_updates": ["message", "callback_query", "pre_checkout_query"]
-            }
-            
-            response = requests.post(url, json=data)
-            result = response.json()
-            
-            if result.get('ok'):
-                logger.info(f"Webhook set successfully to {webhook_url}")
-            else:
-                logger.error(f"Failed to set webhook: {result.get('description')}")
-        
-    except Exception as e:
-        logger.error(f"Error initializing bot: {e}")
-        raise
-
-if __name__ == '__main__':
-    try:
-        if not BOT_TOKEN:
-            logger.error("BOT_TOKEN environment variable not set")
-            exit(1)
+        # Create application
+        application = Application.builder().token(BOT_TOKEN).build()
         
         # Initialize bot
-        initialize_bot()
+        await file_bot.initialize(application)
         
-        logger.info("Starting Flask server on 0.0.0.0:8080...")
+        # Add handlers
+        application.add_handler(CommandHandler("start", file_bot.start_command))
+        application.add_handler(CallbackQueryHandler(file_bot.handle_callback_query))
+        application.add_handler(MessageHandler(
+            filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO,
+            file_bot.handle_file_upload
+        ))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, file_bot.handle_redeem_code))
         
-        # Run Flask app
-        app.run(
-            host='0.0.0.0',
-            port=8080,
-            debug=False,
-            threaded=True
+        # Start polling
+        logger.info("Starting bot...")
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(
+            poll_interval=1.0,
+            timeout=10,
+            bootstrap_retries=-1,
+            read_timeout=10,
+            write_timeout=10,
+            connect_timeout=10,
+            pool_timeout=10
         )
         
+        # Keep running
+        logger.info(f"Bot is running on port {PORT}")
+        
+        # Run forever
+        await asyncio.Event().wait()
+        
     except Exception as e:
-        logger.error(f"Error running server: {e}")
+        logger.error(f"Error running bot: {e}")
         raise
+
+if __name__ == "__main__":
+    # Ensure event loop
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
