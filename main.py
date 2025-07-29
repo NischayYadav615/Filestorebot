@@ -654,14 +654,14 @@ class TelegramFileBot:
             i += 1
         
         return f"{size_bytes:.1f} {size_names[i]}"
-    
-async def run(self):
-    """Start the Telegram bot"""
+        
+    async def run(self):
+    """Start the Telegram bot using polling (no Updater)"""
     try:
-        logger.info("Bot is starting with polling...")
+        logger.info("Starting bot with polling...")
         await self.application.run_polling()
     except Exception as e:
-        logger.error(f"Error during polling: {e}")
+        logger.error(f"Polling error: {e}")
 def main():
     """Main function"""
     # Get bot token from environment
