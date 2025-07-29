@@ -655,47 +655,13 @@ class TelegramFileBot:
         
         return f"{size_bytes:.1f} {size_names[i]}"
     
-    async def run(self):
-        """Run the bot"""
-        try:
-            logger.info("Starting bot...")
-            
-            # Initialize application
-            await self.application.initialize()
-            await self.application.start()
-            
-            # Start polling with better error handling
-            updater = self.application.updater
-            await updater.start_polling(
-                poll_interval=2.0,
-                timeout=20,
-                bootstrap_retries=3,
-                read_timeout=30,
-                write_timeout=30,
-                connect_timeout=30
-            )
-            
-            logger.info("Bot is running and polling...")
-            
-            # Run until stopped
-            try:
-                await updater.idle()
-            except KeyboardInterrupt:
-                logger.info("Received interrupt signal...")
-                
-        except Exception as e:
-            logger.error(f"Error running bot: {e}")
-            raise
-        finally:
-            logger.info("Shutting down bot...")
-            try:
-                if hasattr(self.application, 'updater') and self.application.updater.running:
-                    await self.application.updater.stop()
-                await self.application.stop()
-                await self.application.shutdown()
-            except Exception as e:
-                logger.error(f"Error during shutdown: {e}")
-
+async def run(self):
+    """Start the Telegram bot"""
+    try:
+        logger.info("Bot is starting with polling...")
+        await self.application.run_polling()
+    except Exception as e:
+        logger.error(f"Error during polling: {e}")
 def main():
     """Main function"""
     # Get bot token from environment
