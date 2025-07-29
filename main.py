@@ -7,20 +7,15 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import json
 
-import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebApp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    Application
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler, 
+    ContextTypes, filters
 )
+
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import motor.motor_asyncio
-
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
