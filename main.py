@@ -4,14 +4,14 @@ import asyncio
 import uuid
 import hashlib
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 import json
 
 # Telegram imports
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, 
     LabeledPrice, PreCheckoutQuery, SuccessfulPayment,
-    Bot, InputFile
+    Bot, InputFile, CallbackQuery
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
@@ -396,8 +396,6 @@ class TelegramFileBot:
             await query.edit_message_text(
                 "Please reply with your custom price (number of stars):"
             )
-            # Store context for custom price handling
-            context.user_data[f'custom_price_{unique_id}'] = True
             return
         
         price = 0 if price_type == 'free' else int(price_type)
@@ -544,7 +542,7 @@ class TelegramFileBot:
             parse_mode='Markdown'
         )
     
-    async def show_file_access(self, update: Union[Update, CallbackQuery], file_data: dict, user_id: int):
+    async def show_file_access(self, update, file_data: dict, user_id: int):
         """Show file access options"""
         price = file_data.get('price', 0)
         filename = file_data['filename']
@@ -661,32 +659,42 @@ class TelegramFileBot:
         """Run the bot"""
         try:
             logger.info("Starting bot...")
+            
+            # Initialize application
             await self.application.initialize()
             await self.application.start()
             
-            # Start polling
-            await self.application.updater.start_polling(
-                poll_interval=1.0,
-                timeout=10,
-                bootstrap_retries=-1,
+            # Start polling with better error handling
+            updater = self.application.updater
+            await updater.start_polling(
+                poll_interval=2.0,
+                timeout=20,
+                bootstrap_retries=3,
                 read_timeout=30,
                 write_timeout=30,
-                connect_timeout=30,
-                pool_timeout=1.0,
+                connect_timeout=30
             )
             
-            logger.info("Bot is running...")
+            logger.info("Bot is running and polling...")
             
-            # Keep running
-            while True:
-                await asyncio.sleep(1)
+            # Run until stopped
+            try:
+                await updater.idle()
+            except KeyboardInterrupt:
+                logger.info("Received interrupt signal...")
                 
         except Exception as e:
             logger.error(f"Error running bot: {e}")
             raise
         finally:
             logger.info("Shutting down bot...")
-            await self.application.stop()
+            try:
+                if hasattr(self.application, 'updater') and self.application.updater.running:
+                    await self.application.updater.stop()
+                await self.application.stop()
+                await self.application.shutdown()
+            except Exception as e:
+                logger.error(f"Error during shutdown: {e}")
 
 def main():
     """Main function"""
@@ -694,17 +702,31 @@ def main():
     bot_token = os.getenv('BOT_TOKEN')
     if not bot_token:
         logger.error("BOT_TOKEN environment variable is required!")
-        return
+        logger.error("Please set BOT_TOKEN in your environment variables")
+        return 1
     
-    # Create and run bot
-    bot = TelegramFileBot(bot_token)
+    logger.info("Bot token found, initializing...")
     
+    # Create bot instance
     try:
+        bot = TelegramFileBot(bot_token)
+        logger.info("Bot instance created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create bot instance: {e}")
+        return 1
+    
+    # Run the bot
+    try:
+        logger.info("Starting bot main loop...")
         asyncio.run(bot.run())
+        return 0
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
+        return 0
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    exit(exit_code if exit_code is not None else 0)
