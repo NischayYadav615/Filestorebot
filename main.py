@@ -27,7 +27,7 @@ API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 BOT_USERNAME = os.getenv('BOT_USERNAME', 'your_bot')
-MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0)'
+MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
 DATABASE_NAME = os.getenv('DATABASE_NAME', 'filebot')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # Your server URL for webhook
 
