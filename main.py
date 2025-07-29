@@ -186,9 +186,8 @@ class TelegramFileBot:
     def __init__(self, token: str):
         self.token = token
         self.storage = FileStorage()
-        self.bot = Bot(token)
         
-        # Build application
+        # Build application - CORRECT v20+ way
         self.application = Application.builder().token(token).build()
         
         # Add handlers
@@ -413,7 +412,7 @@ class TelegramFileBot:
         else:
             self.storage.files[unique_id]['price'] = price
         
-        bot_username = (await self.bot.get_me()).username
+        bot_username = (await self.application.bot.get_me()).username
         share_link = f"https://t.me/{bot_username}?start={unique_id}"
         
         price_text = "🆓 FREE" if price == 0 else f"⭐ {price} stars"
@@ -606,13 +605,13 @@ class TelegramFileBot:
                 chat_id = update.callback_query.message.chat_id
             
             if file_type == 'document':
-                await self.bot.send_document(chat_id=chat_id, document=file_id, caption=f"📁 {filename}")
+                await self.application.bot.send_document(chat_id=chat_id, document=file_id, caption=f"📁 {filename}")
             elif file_type == 'photo':
-                await self.bot.send_photo(chat_id=chat_id, photo=file_id, caption=f"🖼️ {filename}")
+                await self.application.bot.send_photo(chat_id=chat_id, photo=file_id, caption=f"🖼️ {filename}")
             elif file_type == 'video':
-                await self.bot.send_video(chat_id=chat_id, video=file_id, caption=f"🎥 {filename}")
+                await self.application.bot.send_video(chat_id=chat_id, video=file_id, caption=f"🎥 {filename}")
             elif file_type == 'audio':
-                await self.bot.send_audio(chat_id=chat_id, audio=file_id, caption=f"🎵 {filename}")
+                await self.application.bot.send_audio(chat_id=chat_id, audio=file_id, caption=f"🎵 {filename}")
         
         except Exception as e:
             logger.error(f"Failed to send file: {e}")
@@ -654,17 +653,9 @@ class TelegramFileBot:
             i += 1
         
         return f"{size_bytes:.1f} {size_names[i]}"
-    
-    async def run(self):
-        """Start the Telegram bot using polling (no Updater)"""
-        try:
-            logger.info("Starting bot with polling...")
-            await self.application.run_polling()
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
 
-def main():
-    """Main function"""
+async def main():
+    """Main function to run the bot"""
     # Get bot token from environment
     bot_token = os.getenv('BOT_TOKEN')
     if not bot_token:
@@ -684,8 +675,11 @@ def main():
     
     # Run the bot
     try:
-        logger.info("Starting bot main loop...")
-        asyncio.run(bot.run())
+        logger.info("Starting bot with polling...")
+        await bot.application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         return 0
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
@@ -695,5 +689,5 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    exit_code = main()
+    exit_code = asyncio.run(main())
     exit(exit_code if exit_code is not None else 0)
