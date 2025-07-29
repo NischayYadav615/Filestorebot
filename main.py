@@ -7,15 +7,20 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import json
 
+import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler, 
-    ContextTypes, filters
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    Application
 )
-
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import motor.motor_asyncio
+
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -44,10 +49,10 @@ class FileBot:
         self.bot_username = None
         self.admin_users = set()
         
-    async def initialize(self, application):
+    async def initialize(self, bot):
         """Initialize bot data"""
         try:
-            bot_info = await application.bot.get_me()
+            bot_info = await bot.get_me()
             self.bot_username = bot_info.username
             logger.info(f"Bot initialized: @{self.bot_username}")
         except Exception as e:
@@ -417,6 +422,93 @@ Choose how many stars you want to purchase:
                 "❌ Unable to create payment. This feature requires proper bot configuration."
             )
 
+    async def show_set_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+        """Show price setting options"""
+        user = update.effective_user
+        
+        # Verify file ownership
+        file_data = await files_collection.find_one({"file_id": file_id, "owner_id": user.id})
+        if not file_data:
+            await update.callback_query.edit_message_text("❌ File not found or you don't own this file.")
+            return
+        
+        text = f"""
+⚙️ **Set Price for File**
+
+📁 **File:** {file_data['file_name']}
+💰 **Current Price:** {file_data['star_price']} ⭐
+
+Choose a new price:
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("🆓 Free", callback_data=f"price_0_{file_id}")],
+            [InlineKeyboardButton("⭐ 1 Star", callback_data=f"price_1_{file_id}"),
+             InlineKeyboardButton("⭐ 2 Stars", callback_data=f"price_2_{file_id}")],
+            [InlineKeyboardButton("⭐ 5 Stars", callback_data=f"price_5_{file_id}"),
+             InlineKeyboardButton("⭐ 10 Stars", callback_data=f"price_10_{file_id}")],
+            [InlineKeyboardButton("⭐ 25 Stars", callback_data=f"price_25_{file_id}"),
+             InlineKeyboardButton("⭐ 50 Stars", callback_data=f"price_50_{file_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data="my_files")]
+        ]
+        
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    async def process_star_payment(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+        """Process star payment for file access"""
+        user = update.effective_user
+        
+        # Get file info
+        file_data = await files_collection.find_one({"file_id": file_id})
+        if not file_data:
+            await update.callback_query.edit_message_text("❌ File not found.")
+            return
+            
+        required_stars = file_data["star_price"]
+        user_stars = await self.get_user_stars(user.id)
+        
+        if user_stars < required_stars:
+            await update.callback_query.edit_message_text("❌ Insufficient stars!")
+            return
+            
+        # Deduct stars from user
+        await users_collection.update_one(
+            {"user_id": user.id},
+            {"$inc": {"stars_balance": -required_stars}}
+        )
+        
+        # Add stars to file owner
+        await users_collection.update_one(
+            {"user_id": file_data["owner_id"]},
+            {"$inc": {"stars_balance": required_stars}}
+        )
+        
+        # Record transaction
+        transaction_data = {
+            "buyer_id": user.id,
+            "seller_id": file_data["owner_id"],
+            "file_id": file_id,
+            "amount": required_stars,
+            "date": datetime.now()
+        }
+        await transactions_collection.insert_one(transaction_data)
+        
+        # Update file access count
+        await files_collection.update_one(
+            {"file_id": file_id},
+            {"$inc": {"access_count": 1}}
+        )
+        
+        # Send file to user
+        await self.send_file_to_user(update, file_data)
+        await update.callback_query.edit_message_text(
+            f"✅ Payment successful! {required_stars} ⭐ stars deducted."
+        )
+
     async def show_redeem_code_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show redeem code input"""
         context.user_data["awaiting_redeem_code"] = True
@@ -584,48 +676,69 @@ Need more help? Contact @NY_BOTS
 file_bot = FileBot()
 
 async def main():
-    """Start the bot"""
+    """Start the bot using simple polling"""
     try:
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
+        # Create bot instance
+        bot = telegram.Bot(token=BOT_TOKEN)
         
-        # Initialize bot
-        await file_bot.initialize(application)
+        # Initialize file bot
+        await file_bot.initialize(bot)
+        
+        # Create application with simple setup
+        app = Application.builder().token(BOT_TOKEN).build()
         
         # Add handlers
-        application.add_handler(CommandHandler("start", file_bot.start_command))
-        application.add_handler(CallbackQueryHandler(file_bot.handle_callback_query))
-        application.add_handler(MessageHandler(
+        app.add_handler(CommandHandler("start", file_bot.start_command))
+        app.add_handler(CallbackQueryHandler(file_bot.handle_callback_query))
+        app.add_handler(MessageHandler(
             filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO,
             file_bot.handle_file_upload
         ))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, file_bot.handle_redeem_code))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, file_bot.handle_redeem_code))
         
-        # Start polling
-        logger.info("Starting bot...")
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(
+        # Add callback handlers for price setting
+        async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            
+            if query.data.startswith("price_"):
+                parts = query.data.split("_")
+                price = int(parts[1])
+                file_id = parts[2]
+                
+                # Update file price
+                result = await files_collection.update_one(
+                    {"file_id": file_id, "owner_id": update.effective_user.id},
+                    {"$set": {"star_price": price}}
+                )
+                
+                if result.modified_count > 0:
+                    await query.edit_message_text(f"✅ Price updated to {price} ⭐ stars!")
+                else:
+                    await query.edit_message_text("❌ Error updating price.")
+        
+        app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^price_"))
+        
+        logger.info("Starting bot with polling...")
+        
+        # Use run_polling instead of the problematic updater
+        await app.run_polling(
             poll_interval=1.0,
             timeout=10,
             bootstrap_retries=-1,
             read_timeout=10,
             write_timeout=10,
             connect_timeout=10,
-            pool_timeout=10
+            pool_timeout=10,
+            drop_pending_updates=True
         )
-        
-        # Keep running
-        logger.info(f"Bot is running on port {PORT}")
-        
-        # Run forever
-        await asyncio.Event().wait()
         
     except Exception as e:
         logger.error(f"Error running bot: {e}")
         raise
 
 if __name__ == "__main__":
+    # Run the bot
     # Ensure event loop
     try:
         asyncio.run(main())
